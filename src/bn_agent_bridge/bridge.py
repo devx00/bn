@@ -28,6 +28,7 @@ from binaryninja.plugin import PluginCommand
 from . import create_comments
 from . import il_format
 from . import mutation_engine
+from . import project_analysis
 from . import project_findings
 from . import project_ops
 from . import project_rootfs
@@ -2714,28 +2715,46 @@ class BinaryNinjaBridge:
             # The gate reads which request reached it from this context, so a
             # self-locking handler (refresh, mutations) reports and honours
             # `no_wait` exactly like a lock="write" op does (#976).
-            with _gate_request_context(op, payload.get("id"), payload.get("no_wait") is True), lock:
-                if spec is not None and spec.destructive:
-                    # The selector the HANDLER will resolve, which is not
-                    # always the request's top-level one (batch_apply prefers
-                    # its manifest's). Judging a different selector both
-                    # refused a legal manifest-only target and let a request
-                    # pass on its top-level selector then act on the
-                    # manifest's "active" (#736 review, P1).
-                    selector = (
-                        spec.selector(params, target) if spec.selector is not None
-                        else target
+            with _gate_request_context(op, payload.get("id"), payload.get("no_wait") is True):
+                project_context = None
+                if op in {"taint", "resolved_calls", "callsites", "xrefs", "xrefs_any"} or (
+                    op == "backward_slice" and params.get("interprocedural") is True
+                ):
+                    # Provider opens require the write gate, and their analysis
+                    # must not run under the dispatch read lock. Pin the original
+                    # selection before loading can add targets or change focus.
+                    reverse = (
+                        params.get("direction", "forward") == "backward" if op == "taint"
+                        else str(params.get("direction", "both")) in {"callers", "both"}
+                        if op == "resolved_calls" else True
                     )
-                    pinned = self.targets.pin_destructive_target(str(op), selector)
-                    if pinned is not None:
-                        # Forward the stable id the count was taken on, in BOTH
-                        # places the handler may read it from, so the later
-                        # (and for lock="none", unlocked) resolve cannot land
-                        # on a view that replaced the one this gate allowed.
-                        target = pinned
-                        if spec.selector is not None:
-                            params = {**params, "target": pinned}
-                result = self._dispatch_on_main(op, params, target)
+                    project_context, root_target_id = project_analysis.prepare(
+                        self, target, params, reverse=reverse)
+                    if project_context is not None:
+                        target = PinnedTarget(root_target_id)
+                activation = (
+                    project_context.activate() if project_context is not None
+                    else contextlib.nullcontext()
+                )
+                with lock, activation:
+                    if project_context is not None:
+                        project_context.validate(self)
+                    if spec is not None and spec.destructive:
+                        # Judge the selector the handler actually resolves.
+                        selector = (
+                            spec.selector(params, target) if spec.selector is not None
+                            else target
+                        )
+                        pinned = self.targets.pin_destructive_target(str(op), selector)
+                        if pinned is not None:
+                            # Preserve exact identity across self-managed lock
+                            # phases, including manifest-target precedence.
+                            target = pinned
+                            if spec.selector is not None:
+                                params = {**params, "target": pinned}
+                    result = self._dispatch_on_main(op, params, target)
+                    if project_context is not None:
+                        result = project_context.annotate(result)
             return _json_response(ok=True, result=result)
         except Exception as exc:
             # When the failure carries an unclearable has_user_type residue, the

@@ -52,6 +52,7 @@ from ._shared import (
     is_placeholder_symbol_name,
 )
 from .paths import cache_home
+from .project_analysis import current as _project_current
 from .bridge_state import (
     _opened_annotations,
     _quick_loaded_views,
@@ -236,7 +237,8 @@ def _attach_callsite_excerpts(bv, page_rows: list[dict[str, Any]]) -> None:
 
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
                                stub_addrs: frozenset[int] = frozenset(),
-                               variadic_hint: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                               variadic_hint: dict[str, Any] | None = None,
+                               project_sites: dict[int, Any] | None = None) -> list[dict[str, Any]]:
     func_arch = getattr(func, "arch", None)
     disasm_entries = il_format._structured_disasm_entries(bv, func)
     index_by_addr = {
@@ -260,21 +262,39 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
     # inspect this function's call insns, so matching on it stays correctly scoped.
     _get_code_refs = getattr(bv, "get_code_refs", None)
     code_ref_addrs: set[int] = set()
-    if callable(_get_code_refs):
+    if project_sites is None and callable(_get_code_refs):
         for target in callee_addresses:
             code_ref_addrs |= {int(getattr(ref, "address", -1)) for ref in _get_code_refs(target)}
     rows = []
-    for insn in il_format._iter_llil_instructions(func):
+    def instructions():
+        seen = set()
+        for instruction in il_format._iter_llil_instructions(func):
+            if project_sites is not None:
+                address = int(getattr(instruction, "address", -1))
+                if address not in project_sites or address in seen:
+                    continue
+                if "CALL" not in il_format._il_op_name(instruction):
+                    continue
+                seen.add(address)
+            yield instruction
+        if project_sites is not None:
+            # MLIL may retain a confirmed call where the LLIL renderer cannot
+            # recover a call instruction. Keep that evidence and its reasons.
+            for address, site in project_sites.items():
+                if address not in seen:
+                    yield site.instruction
+
+    for insn in instructions():
         op_name = il_format._il_op_name(insn)
         # Count tail-branch references too (a `b`/branch into the sink rendered
         # as `return <addr>(...) __tailcall`), not just bl/blx -- xrefs and
         # taint backward already treat these as calls, so callsites must agree
         # or it silently misses a reachable sink during triage (#47).
-        if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
+        if project_sites is None and op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
             continue
         call_addr = int(getattr(insn, "address", 0))
         dest_value = il_format._llil_constant_value(getattr(insn, "dest", None))
-        if dest_value not in callee_addresses and call_addr not in code_ref_addrs:
+        if project_sites is None and dest_value not in callee_addresses and call_addr not in code_ref_addrs:
             continue
         call_kind = "tailcall" if "TAILCALL" in op_name else "call"
 
@@ -897,6 +917,80 @@ def _scan_caller_functions(
     return scope_functions, truncated, "; ".join(notes) if notes else None
 
 
+def _project_callsites(ctx, project, bv, callee, *, within_identifiers, context,
+                       offset, limit, callee_symbol_only):
+    selected = project.resolve(bv, int(callee.start))
+    target_view, target_function = bv, callee
+    if selected.status == "resolved":
+        target_view, target_function = selected.view, selected.function
+        callee_symbol_only = False
+    scopes = None
+    if within_identifiers:
+        scopes = {
+            project.function_key(bv, function): str(query)
+            for query, function in ctx._resolve_scope_functions(bv, within_identifiers)
+        }
+    groups = {}
+    for site in project.callers(target_view, target_function):
+        key = project.function_key(site.view, site.function)
+        if scopes is not None and key not in scopes:
+            continue
+        if key not in groups:
+            groups[key] = (site.view, site.function, {})
+        groups[key][2].setdefault(site.address, site)
+    rows_by_site = {}
+    hint = _callee_variadic_hint(target_function)
+    target_identity = read_xrefs._project_function_identity(project, target_view, target_function)
+    for key in sorted(groups):
+        source_view, function, sites = groups[key]
+        rows = _callsites_within_function(
+            ctx, source_view, target_function, function, context=context,
+            variadic_hint=hint, project_sites=sites)
+        for index, row in enumerate(rows):
+            row["callee"] = dict(target_identity)
+            row["containing_function"] = read_xrefs._project_function_identity(
+                project, source_view, function)
+            row.update(project.identity(source_view))
+            row["call_index"] = index
+            row["within_query"] = scopes[key] if scopes is not None else str(function.name)
+            row["also_in"] = [
+                {**other, **project.identity(source_view)}
+                for other in _other_containing_functions(ctx, source_view, row["call_addr"], function)
+            ]
+            rows_by_site.setdefault((key[0], int(row["call_addr"], 16)), row)
+    rows = [rows_by_site[key] for key in sorted(rows_by_site)]
+    result = read_misc._paged_list_result(rows, offset=offset, limit=limit, kind="callsites")
+    # Rendering is per returned page and per source view: identical addresses
+    # in two libraries must never share a decompile cache.
+    for file_id, source_view in project.views.items():
+        page = [row for row in result["items"] if row["project_file_id"] == file_id]
+        if page:
+            _attach_callsite_excerpts(source_view, page)
+    result.update(
+        callee=target_identity,
+        resolution=selected.status,
+        resolution_detail=selected.reason,
+        scan_truncated=False,
+        callers_scanned=len(groups),
+        caller_total=len(groups),
+        callee_symbol_only=callee_symbol_only,
+        **_callee_data_refs(ctx, target_view, int(target_function.start)),
+    )
+    result["callee_data_ref_target"] = target_identity
+    result["callee_data_ref_locations"] = [
+        project.identity(target_view, address=int(address, 16))
+        for address in result.get("callee_data_refs", [])
+    ]
+    if selected.cross_file:
+        result["resolved_from"] = selected.source
+    read_xrefs._project_read_completeness(project, result)
+    result["caller_scan_truncated"] = result["partial"]
+    result["caller_scan_note"] = (
+        "Project caller discovery is incomplete; see boundaries." if result["partial"] else None
+    )
+    return result
+
+
 def _callsites(
     ctx,
     selector: str | None,
@@ -964,6 +1058,11 @@ def _callsites(
             start=int(getattr(symbol, "address", 0)),
         )
         callee_symbol_only = True
+    project = _project_current(bv)
+    if project is not None:
+        return _project_callsites(
+            ctx, project, bv, callee, within_identifiers=within_identifiers,
+            context=context, offset=offset, limit=limit, callee_symbol_only=callee_symbol_only)
     # #286: an exported callee's intra-lib callers route through its same-name PLT
     # stub, so a call targeting the stub must count as a call to the callee.
     try:

@@ -9,10 +9,12 @@ from ..cli import (
     _call,
     _depth_int,
     _int_at_least,
+    _project_analysis_params,
     arg,
     command,
     decode_json_input,
     mangled_arg,
+    project_analysis_args,
     read_text_input,
 )
 from ..formatters import (
@@ -152,6 +154,7 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
                  help="Text: one row per direct call site instead of one row per distinct "
                       "callee/caller with its count (JSON is always per site)"),
              mangled_arg(),
+             *project_analysis_args(),
          ],
          estimable=True)
 def _dataflow_callgraph(args: argparse.Namespace) -> int:
@@ -162,6 +165,7 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
             "identifier": args.identifier,
             "direction": args.direction,
             "resolve_indirect": bool(args.resolve_indirect),
+            **_project_analysis_params(args),
         },
         require_target=True,
         text_renderer=lambda value: _resolution_note(value) + _render_callgraph_text(
@@ -243,6 +247,7 @@ _SINK_LOCATOR_HELP = (
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
              mangled_arg(),
+             *project_analysis_args(),
          ],
          estimable=True)
 def _taint_forward(args: argparse.Namespace) -> int:
@@ -256,6 +261,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "unknown_call": args.unknown_call,
         "enabled_sink_classes": list(args.sink_classes or []),
         "mangled": args.mangled,
+        **_project_analysis_params(args),
     }
     _add_resolve_map(args, params)
     _add_user_models(args, params)
@@ -294,6 +300,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
              mangled_arg(),
+             *project_analysis_args(),
          ],
          estimable=True)
 def _taint_backward(args: argparse.Namespace) -> int:
@@ -304,6 +311,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "sinks": list(args.sinks),
         "max_depth": int(args.max_depth),
         "mangled": args.mangled,
+        **_project_analysis_params(args),
     }
     _add_resolve_map(args, params)
     _add_user_models(args, params)

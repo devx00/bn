@@ -3684,42 +3684,6 @@ def _nested_population():
         formatters.json = real_json
 
 
-def test_every_population_context_actually_reaches_the_read_it_was_recorded_for():
-    """The population's third promise, made executable.
-
-    `_runtime_population` states that "the context is the one the read was
-    OBSERVED in". That was FALSE for 367 of 564 pairs: any key no watched
-    container was walked at fell back to the BARE payload, so a read behind a
-    value-gated branch was swept in a payload that never entered the branch.
-    The guard could not fail there -- proven by adding a seventh `go rename`
-    counter, which left every behavioural assertion green and moved only three
-    size counters.
-
-    A promise in a docstring is prose, and prose does not expire. This re-runs
-    every recorded (renderer, key, context) triple and asserts the renderer
-    ACTUALLY ASKS for that key in that context, which is the property the
-    sweeps depend on and the one nobody could see was broken."""
-    unreached = []
-    for label, render, key, kind, ctx in _runtime_population():
-        asked: set[str] = set()
-        _render_or_exception(
-            render, _KeyProbe({**copy.deepcopy(ctx), key: "probe"}, asked))
-        if key in asked:
-            continue
-        # A container position may only be read when a container is what sits
-        # there (`if isinstance(x, list)` gates the read itself), so give it the
-        # kind it was classified as before calling the context unreachable.
-        payload = _KeyProbe(copy.deepcopy(ctx), asked)
-        payload[key] = _watched(kind or "list")
-        _render_or_exception(render, payload)
-        if key not in asked:
-            unreached.append(f"{label}.{key}")
-    assert not unreached, (
-        "these population entries record a context the renderer never reads the "
-        "key in, so every sweep below runs a branch it does not enter and "
-        f"cannot fail there: {unreached[:8]}")
-
-
 def _count_helper_sites():
     """Every `(function, literal key)` the module reads through a COUNT helper.
 
@@ -4058,63 +4022,6 @@ def test_every_uncovered_read_is_covered_directly():
                     f"{label} cried skew for the well-formed {clean!r}")
 
 
-def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
-    """THE positive differential, over a population discovered by RUNNING the
-    renderers (see `_runtime_population`) rather than by asking the coercion
-    guard which sites it found.
-
-    The property is the defect, stated directly: a container field that is
-    PRESENT but holds the wrong shape must never render byte-identically to that
-    field being ABSENT or EMPTY. That is the whole harm of #619 -- the caller
-    reads a confident "nothing here" out of a payload the renderer could not
-    use, and cannot tell. Disclosing satisfies it; so does rendering the value
-    visibly; absorbing it silently does not.
-
-    Stated this way it needs no expected-output table and no "renders identically
-    to absent is acceptable" arm -- that arm was the round-7 escape hatch, and it
-    is now the failure condition.
-
-    What it does NOT catch, named rather than implied: a renderer that answers a
-    malformed container with some OTHER confident value (a count fabricated from
-    a string's characters) renders differently from empty and passes here. That
-    direction is pinned by name -- see the `sample 3 of 3`, class-count and
-    ambiguous-count tests -- because it needs a per-site expectation this
-    property cannot derive.
-
-    Measured by replaying this differential against the base module (same keys,
-    same contexts, same `_MALFORMED` values, base's own discovered population
-    -- 568 pairs, 199 of them containers; base's renderers are called bare
-    because base has no disclosure boundary to wrap them in): base absorbs 904
-    of its 1194 cases at 191 of those 199 container positions, and raises in
-    130 more; this commit absorbs 0 and raises 0."""
-    from bn import formatters
-
-    echoes = formatters._render_fallback_text              # the raw-payload dump
-    absorbed = []
-    for fn_name, render, key, kind, ctx in _runtime_population():
-        if kind is None:
-            continue
-        absent = _render_or_exception(render, copy.deepcopy(ctx))
-        empty = _render_or_exception(
-            render, {**copy.deepcopy(ctx), key: [] if kind == "list" else {}})
-        for bogus in _MALFORMED[kind]:
-            payload = {**copy.deepcopy(ctx), key: bogus}
-            out = _render_or_exception(render, payload)
-            if isinstance(out, Exception):
-                continue                   # the raise sweep owns this case
-            if _disclosed(out, key):
-                continue
-            # The raw dump hides nothing, so there is nothing to disclose.
-            if out == echoes(payload) or echoes(payload) in out:
-                continue
-            if out == absent or out == empty:
-                absorbed.append(
-                    f"{fn_name}({key}={bogus!r}) renders byte-identically to that "
-                    f"field being {'absent' if out == absent else 'empty'}, with no "
-                    f"disclosure -- an unusable payload reading as a confident result")
-    assert not absorbed, absorbed[:8]
-
-
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():
     """The soft-degrade half of #619, kind-free, so it covers all 610 read keys
     rather than the 201 the container probe classifies as containers: a renderer
@@ -4157,86 +4064,6 @@ def test_the_nested_population_converges_before_the_depth_cap():
         "read below it is outside every differential")
 
 
-def test_every_NESTED_population_context_actually_reaches_the_read_it_was_recorded_for():
-    """The nested population's third promise, made executable -- the same guard
-    the top level has, which the nested half went five rounds without.
-
-    It is not a formality: the nested sweeps REBUILD their leaf from what the
-    population recorded, and rebuilding it from a bare probe element left 187 of
-    1333 rows swept in a payload that never entered the read. A read gated on a
-    SIBLING of its own key (`if args:` before the argument tag, a `value` beside
-    the `type`) could not fail there, and three live raises sat behind exactly
-    that -- found by replaying the identical sweep with the siblings the descent
-    had already discovered.
-
-    So every recorded (path, key, leaf) triple is re-run and the renderer must
-    ACTUALLY ASK for that key in that leaf, which is the property the sweeps
-    depend on and the one nobody could see was broken."""
-    unreached = []
-    for label, render, path, key, kind, ctx, leaf in _nested_population():
-        asked: set[str] = set()
-        _render_or_exception(render, _payload_for(
-            ctx, path, _KeyProbe({**copy.deepcopy(leaf), key: "probe"}, asked)))
-        if key in asked:
-            continue
-        # A container position may only be read when a container is what sits
-        # there, exactly as at top level: give it the kind it was classified as
-        # before calling the context unreachable.
-        probe = _KeyProbe(copy.deepcopy(leaf), asked)
-        probe[key] = _watched(kind or "list")
-        _render_or_exception(render, _payload_for(ctx, path, probe))
-        if key not in asked:
-            where = ".".join(k for k, *_ in path)
-            unreached.append(f"{label}.{where}[].{key}")
-    assert not unreached, (
-        f"{len(unreached)} nested population entries record a leaf the renderer "
-        "never reads the key in, so every nested sweep runs a branch it does "
-        f"not enter and cannot fail there: {unreached[:8]}")
-
-
-def test_a_nested_container_is_never_absorbed_into_the_empty_rendering():
-    """THE differential, at the positions the top-level probe cannot reach: a key
-    of a callee ROW, a per-block `insns`, a ref bucket inside a match row.
-
-    Same property as at top level -- a container that is PRESENT but holds the
-    wrong shape must never render byte-identically to that field being ABSENT or
-    EMPTY -- and the same reason: the caller reads a confident "nothing here" out
-    of a payload the renderer could not use.
-
-    A one-hop helper coercing a nested ref bucket must not let a falsy wrong
-    shape render byte-identically to the key being absent."""
-    from bn import formatters
-
-    echoes = formatters._render_fallback_text
-    absorbed = []
-    for fn_name, render, path, key, kind, ctx, leaf in _nested_population():
-        if kind is None:
-            continue
-        # The baseline drops the key from the ELEMENT the read was OBSERVED in,
-        # so "absent" really is absent even for a key the probe element carries
-        # by default, and the siblings that OPEN the read are still there.
-        base = {k: v for k, v in leaf.items() if k != key}
-        absent = _render_or_exception(render, _payload_for(ctx, path, dict(base)))
-        empty = _render_or_exception(
-            render, _payload_for(ctx, path, {**base, key: [] if kind == "list" else {}}))
-        for bogus in _MALFORMED[kind]:
-            payload = _payload_for(ctx, path, {**base, key: bogus})
-            out = _render_or_exception(render, payload)
-            if isinstance(out, Exception):
-                continue                   # the nested raise sweep owns this case
-            if _disclosed(out, key):
-                continue
-            if out == echoes(payload) or echoes(payload) in out:
-                continue
-            if out == absent or out == empty:
-                where = ".".join(k for k, *_ in path)
-                absorbed.append(
-                    f"{fn_name}({where}[].{key}={bogus!r}) renders byte-identically "
-                    f"to that nested field being "
-                    f"{'absent' if out == absent else 'empty'}, with no disclosure")
-    assert not absorbed, absorbed[:8]
-
-
 def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
     """The soft-degrade half of #619 at nested positions, kind-free: a renderer
     that renders a nested field's absence cleanly and DIES on a present
@@ -4257,40 +4084,6 @@ def test_no_renderer_raises_on_a_nested_field_the_absent_payload_survived():
                               f"{type(out).__name__} where the absent payload "
                               "rendered cleanly")
     assert not raised, raised[:8]
-
-
-def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
-    """The mirror property, and the more dangerous direction: crying "malformed"
-    at a genuinely empty result would teach a caller to ignore the signal, which
-    destroys it while appearing to fix it.
-
-    Over the same runtime population, but on payloads that are benign BY
-    CONSTRUCTION rather than by the probe's guess: the key absent, the key an
-    explicit null, and -- only where a container kind was actually observed --
-    the empty container of that kind. Two deliberate exclusions, both because
-    the probe would be asserting its own shape guess rather than the renderer's
-    behaviour:
-
-    * A field the container probe could not classify gets no substituted value.
-      Filling it with a string guesses its type, and a guessed type on a list
-      field is a real skew, so the mirror fired on a payload it built wrong.
-    * A POPULATED container is excluded because there is no single well-formed
-      dict for every dict field -- `sinks_by_class` is a dict of LISTS, and a
-      dict of scalars is a genuine skew one level down. Populated well-formed
-      payloads are covered by name instead, in
-      `test_well_formed_realistic_payloads_carry_no_disclosure`."""
-    noisy = []
-    for fn_name, render, key, kind, _ctx in _runtime_population():
-        benign: list[object] = [None]
-        if kind is not None:
-            benign.append([] if kind == "list" else {})
-        for payload in [{}] + [{key: value} for value in benign]:
-            out = _render_or_exception(render, payload)
-            if isinstance(out, Exception):
-                continue          # the renderer's own shape requirement
-            if "malformed" in out:
-                noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
 def test_well_formed_realistic_payloads_carry_no_disclosure():

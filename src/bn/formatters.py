@@ -3416,6 +3416,14 @@ def _exact_first_note(value: Any) -> str:
             "address; --exact shows only exact matches")
 
 
+def _project_endpoint_suffix(endpoint: Any) -> str:
+    fields = []
+    for key in ("project_file_id", "project_path"):
+        if _field_present(endpoint, key):
+            fields.append(f"{key}={_escape_control_chars(_text_value(endpoint, key))}")
+    return " [" + ", ".join(fields) + "]" if fields else ""
+
+
 def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []
@@ -3453,6 +3461,10 @@ def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dic
                 key = ("site", str(ref.get("address", "<unknown>")))
             caller_address = None
             caller_name = label or None
+        provenance = _project_endpoint_suffix(caller) or _project_endpoint_suffix(ref)
+        if provenance:
+            key += (provenance,)
+            caller_name = f"{caller_name or '<unknown>'}{provenance}"
         if key not in groups:
             groups[key] = {
                 "caller_address": caller_address,
@@ -3510,7 +3522,102 @@ def _xref_buckets(value: dict[str, Any]) -> tuple[list[Any], list[Any], int, int
     return code_refs, data_refs, total_code, total_data
 
 
+def _project_analysis_incomplete(value: Any) -> bool:
+    if not _field_declared(value, "project_analysis"):
+        return False
+    metadata = _field_dict(value, "project_analysis")
+    return (_flag_field(metadata, "complete") is False
+            or _flag_field(metadata, "truncated") is True
+            or _flag_field(value, "partial") is True
+            or _flag_field(value, "complete") is False
+            or _flag_field(value, "truncated") is True)
+
+
+def _project_analysis_text(renderer: Callable[..., str]) -> Callable[..., str]:
+    """Keep standalone text exact while retaining project-only evidence.
+
+    Row paths tie file identities to individual sites/path steps even when the
+    compact renderer groups rows or hides SSA detail. The metadata is uncapped:
+    omitted boundaries or provider aliases would change the meaning of a result.
+    """
+    @functools.wraps(renderer)
+    def render(value: Any, *args: Any, **kwargs: Any) -> str:
+        body = renderer(value, *args, **kwargs)
+        if not isinstance(value, dict) or not _field_declared(value, "project_analysis"):
+            return body
+        # Real project responses carry this envelope. Do not traverse arbitrary
+        # standalone fields looking for identities or reinterpret their shapes.
+        lines: list[str] = []
+        metadata = _field_dict(value, "project_analysis")
+        for key in ("complete", "truncated"):
+            _flag_field(metadata, key)
+        _field_dict(metadata, "limits")
+        for key in ("files", "boundaries"):
+            for record in _row_list(metadata, key):
+                if key == "files":
+                    _field_list(record, "aliases")
+                    _flag_field(record, "loaded")
+        # Print every metadata field, including provider aliases and future
+        # boundary details, rather than selecting an incomplete summary.
+        lines.append("project_analysis:")
+        lines.extend("  " + line for line in json.dumps(
+            value["project_analysis"], indent=2, ensure_ascii=True).splitlines())
+
+        def endpoints(node: dict[str, Any], path: str) -> None:
+            fields = {key: item for key, item in node.items()
+                      if key.startswith("project_") and key != "project_analysis"}
+            if fields:
+                for key in ("name", "display_name", "function", "address",
+                            "call_addr", "callsite", "caller_static", "kind"):
+                    if _field_declared(node, key) and not isinstance(node[key], (dict, list)):
+                        fields[key] = node[key]
+            for key, item in node.items():
+                if (key in ("complete", "partial", "truncated", "boundaries",
+                            "resolution", "resolution_detail", "status", "resolved_from")
+                        or key.endswith("_lower_bound")):
+                    fields[key] = item
+                    if key in ("complete", "partial", "truncated"):
+                        _flag_field(node, key)
+                    elif key == "boundaries":
+                        _field_list(node, key)
+                    elif key == "resolved_from":
+                        _field_dict(node, key)
+            if fields:
+                lines.append(f"  {path}: " + json.dumps(fields, ensure_ascii=True))
+            # This is an open-content walk, not a schema declaration: a field
+            # may legitimately hold a scalar, mapping, or sequence. Validate
+            # only the known project fields above; re-reading arbitrary values
+            # through _field_dict/_field_list would assign them a false schema.
+            for key, item in node.items():
+                if key == "project_analysis":
+                    continue
+                if isinstance(item, dict):
+                    endpoints(item, f"{path}.{key}")
+                elif isinstance(item, list):
+                    for index, row in enumerate(item):
+                        if isinstance(row, dict):
+                            endpoints(row, f"{path}.{key}[{index}]")
+
+        endpoints(value, "result")
+        if not lines:
+            return body
+        incomplete = _project_analysis_incomplete(value)
+        notice = ("! project analysis incomplete: rows/counts below may be partial; "
+                  "empty results are not an all-clear\n" if incomplete else "")
+        return notice + body + "\n\nproject provenance and coverage:\n" + "\n".join(lines)
+
+    return render
+
+
+def _project_count_label(value: dict[str, Any], key: str, default: Any = 0) -> Any:
+    lower_bound = f"{key}_lower_bound"
+    if _field_present(value, lower_bound):
+        return f"at least {_stated_count(value, lower_bound)}"
+    return value.get(key, default)
+
+
 @_discloses
+@_project_analysis_text
 def _render_xrefs_any_text(value: Any) -> str:
     """Render the multi-symbol sink-sweep (`xrefs --any`): one line per symbol,
     present (with counts) or absent (#218). When a probed symbol is a string
@@ -3527,8 +3634,8 @@ def _render_xrefs_any_text(value: Any) -> str:
             continue
         if s.get("present"):
             lines.append(
-                f"  {s.get('symbol')}: {s.get('code_ref_count', 0)} code refs across "
-                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}"
+                f"  {s.get('symbol')}: {_project_count_label(s, 'code_ref_count')} code refs across "
+                f"{_project_count_label(s, 'caller_function_count')} fn(s)  @ {s.get('address', '?')}"
                 + (" [string]" if s.get("target_kind") == "string" else ""))
             if s.get("target_kind") == "string":
                 string_targets += 1
@@ -3543,20 +3650,27 @@ def _render_xrefs_any_text(value: Any) -> str:
 
 
 @_discloses
+@_project_analysis_text
 def _render_xrefs_text(value: Any, limit: int | None = None, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
     code_refs, data_refs, total_code, total_data = _xref_buckets(value)
+    total_code = _project_count_label(value, "code_ref_count", total_code) if (
+        _field_present(value, "code_ref_count_lower_bound")) else total_code
+    total_data = _project_count_label(value, "data_ref_count", total_data) if (
+        _field_present(value, "data_ref_count_lower_bound")) else total_data
 
     import_label = ""
     if value.get("import_resolved"):
         scanned = " (scanned)" if value.get("code_refs_scanned") else ""
         import_label = f"import: {value.get('import_name', '<unknown>')}{scanned}"
 
-    def _render_group(refs: list[Any], total: int, label: str) -> list[str]:
+    def _render_group(refs: list[Any], total: int | str, label: str) -> list[str]:
         groups = _group_refs_by_caller(refs, mangled=mangled)
         if not groups:
+            if _project_analysis_incomplete(value):
+                return [f"{label}:", "- none observed; project coverage is incomplete"]
             return [f"{label}:", "- none"]
         site_word = "site" if total == 1 else "sites"
         # The groups are distinct CALLERS, which may be functions OR function-less
@@ -4957,6 +5071,7 @@ def _render_init_arrays_text(value: Any) -> str:
 
 
 @_discloses
+@_project_analysis_text
 def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
                            mangled: bool = False, scoped: bool = True) -> str:
     # callsites returns the {items,total,...} envelope (#131 / item 11). Keep the
@@ -4980,6 +5095,10 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
         caller_scan_note = value.get("caller_scan_note")
+        if _project_analysis_incomplete(value):
+            scan_truncated = True
+            caller_scan_note = (caller_scan_note or
+                                "project coverage incomplete; see project_analysis boundaries")
         data_ref_note = _callsites_data_ref_note(value.get("callee_data_ref_count"),
                                                  value.get("callee_data_refs"),
                                                  value.get("callee_data_ref_vtables"),
@@ -5032,6 +5151,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         # #978: the demangled display name, the spelling decompile prints.
         containing_name = _shown_name(containing, mangled=mangled) or "<unknown>"
         callee_name = _shown_name(callee, mangled=mangled) or "<unknown>"
+        containing_name = f"{containing_name}{_project_endpoint_suffix(containing)}"
+        callee_name = f"{callee_name}{_project_endpoint_suffix(callee)}"
         lines = [
             primary,
             (
@@ -5295,6 +5416,7 @@ def _callgraph_site_list(sites: list[Any]) -> str:
 
 
 @_discloses
+@_project_analysis_text
 def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool = False) -> str:
     """`dataflow callgraph` text. By default each distinct direct callee and
     each distinct caller is one row with its call count and first sites
@@ -5321,6 +5443,7 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
             if c.get("kind") == "direct":
                 tgt = _field_dict(c, "target")
                 name = _shown_name(tgt, mangled=mangled) or "<unknown>"
+                name = f"{name}{_project_endpoint_suffix(tgt)}"
                 if per_site:
                     rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}")
                     continue
@@ -5334,7 +5457,8 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
                 resolved = _field_list(c, "resolved")
                 if resolved:
                     tgts = ", ".join(
-                        f"{_shown_name(_as_dict(r), mangled=mangled) or '?'}@{_as_dict(r).get('address')}"
+                        f"{_shown_name(_as_dict(r), mangled=mangled) or '?'}"
+                        f"{_project_endpoint_suffix(r)}@{_as_dict(r).get('address')}"
                         for r in resolved)
                     suffix = f"resolved: {tgts}"
                 else:
@@ -5363,6 +5487,7 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
                 continue
             caller = _field_dict(c, "caller")
             name = _shown_name(caller, mangled=mangled) or "<unknown>"
+            name = f"{name}{_project_endpoint_suffix(caller)}"
             if per_site:
                 site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
                 rows.append(f"  {site}{name} @ {caller.get('address', '?')}")
@@ -5887,6 +6012,7 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
 
 
 @_discloses
+@_project_analysis_text
 def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -8763,6 +8889,7 @@ _TRACE_REASON_LABELS: dict[str, str] = {
 
 
 @_discloses
+@_project_analysis_text
 def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

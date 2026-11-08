@@ -29,6 +29,8 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from contextlib import contextmanager
+from functools import wraps
 from typing import Any
 
 # Structural split (#562): the engine re-exports the moved names so existing
@@ -273,6 +275,19 @@ def _code(text: Any) -> str:
     return json.dumps(t) if "`" in t else f"`{t}`"
 
 
+def _in_function_view(method):
+    """Keep recursive IL analysis and its provenance in the owning view."""
+    @wraps(method)
+    def scoped(self, func, *args, **kwargs):
+        if self.project_context is None:
+            return method(self, func, *args, **kwargs)
+        with self._view_scope(func):
+            result = method(self, func, *args, **kwargs)
+            self._qualify_analysis(result, func)
+            return result
+    return scoped
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -287,8 +302,12 @@ class TaintEngine:
         max_iters: int = 256,
         max_depth: int = 64,
         mangled: bool = False,
+        project_context: Any = None,
     ):
         self.bv = bv
+        self.project_context = project_context
+        self._root_view = bv
+        self._project_return_buffers: set[tuple] = set()
         self.models = models
         self._find_variable = find_variable
         self.unknown_call_policy = unknown_call_policy
@@ -301,6 +320,7 @@ class TaintEngine:
         self.resolve_map = normalize_resolve_map(
             {} if resolve_map is _NO_RESOLVE_MAP else resolve_map,
             origin=resolve_map_origin, find_function=find_function)
+        self._root_resolve_map = self.resolve_map
         self.max_iters = max_iters
         self.max_depth = max_depth
         self.mangled = mangled
@@ -323,6 +343,103 @@ class TaintEngine:
         # Definite stash-slot proofs (`_definite_slot_store`), per function
         # and load: structural, so one answer serves every fixed-point sweep.
         self._slot_proofs: dict[Any, tuple[Any, dict[Any, Any]]] = {}
+
+    def _function_view(self, func: Any) -> Any:
+        if self.project_context is None:
+            return self.bv
+        view = getattr(func, "view", None)
+        if view is not None:
+            fid = self.project_context.file_id(view)
+            if fid in self.project_context.views:
+                return self.project_context.views[fid]
+        return self.bv
+
+    def _function_key(self, func: Any) -> Any:
+        if self.project_context is None:
+            return int(getattr(func, "start", 0))
+        return self.project_context.function_key(self._function_view(func), func)
+
+    @contextmanager
+    def _view_scope(self, func_or_bv: Any):
+        if self.project_context is None:
+            yield
+            return
+        view = (self._function_view(func_or_bv) if hasattr(func_or_bv, "parameter_vars")
+                else func_or_bv)
+        saved = self.bv, self.resolve_map, self._bt_func_token, getattr(self, "_active_func", None)
+        self.bv = view
+        self._active_func = func_or_bv if hasattr(func_or_bv, "parameter_vars") else None
+        if self.project_context.file_id(view) != self.project_context.file_id(self._root_view):
+            self.resolve_map = {}
+        else:
+            self.resolve_map = self._root_resolve_map
+        try:
+            yield
+        finally:
+            self.bv, self.resolve_map, self._bt_func_token, self._active_func = saved
+
+    def _memory_key(self, kind: str, address: int, *extra: Any) -> tuple:
+        key = (kind, address, *extra)
+        if self.project_context is not None:
+            key += (self.project_context.file_id(self.bv),)
+        return key
+
+    def _project_row(self, row: dict, bv: Any = None, func: Any = None) -> dict:
+        if self.project_context is not None:
+            existing_file = row.get("project_file_id")
+            if existing_file is not None and existing_file != self.project_context.file_id(bv or self.bv):
+                return row
+            identity = self.project_context.identity(bv or self.bv, function=func)
+            for key, value in identity.items():
+                row.setdefault(key, value)
+        return row
+
+    def _project_call(self, ins: Any, address: int | None = None) -> Any:
+        if self.project_context is None:
+            return None
+        if address is None:
+            return self.project_context.resolve_call(self.bv, ins)
+        return self.project_context.resolve(self.bv, address)
+
+    def _instr_dict(self, ins: Any, **kwargs: Any) -> dict:
+        return self._project_row(_instr_dict(ins, **kwargs), func=getattr(self, "_active_func", None))
+
+    def _qualify_analysis(self, result: Any, func: Any) -> None:
+        """Qualify local rows before restoring a caller's view; keep child rows."""
+        if self.project_context is None:
+            return
+        if isinstance(result, list):
+            for row in result:
+                for step in row.get("steps", []):
+                    self._project_row(step, func=func)
+                self._project_row(row.get("origin", {}), func=func)
+            return
+        for finding in result.get("findings", []):
+            self._project_row(finding.get("sink", {}), func=func)
+            for step in finding.get("path", []):
+                self._project_row(step, func=func)
+        for leaf in result.get("leaves", []):
+            self._project_row(leaf, func=func)
+        for path in [result.get("return_path", []), *result.get("out_paths", {}).values()]:
+            for step in path:
+                self._project_row(step, func=func)
+
+    def _project_finish(self, result: dict, func: Any) -> dict:
+        if self.project_context is None:
+            return result
+        self._project_row(result.get("function", {}), func=func)
+        for key in ("sources", "sinks", "sink_status"):
+            for row in result.get(key, []):
+                self._project_row(row, func=func)
+        for row in result.get("slices", []):
+            self._project_row(row.get("sink", {}), func=func)
+        for row in result.get("leaves", []):
+            self._project_row(row, func=func)
+        for row in result.get("by_source", {}).values():
+            self._project_row(row, func=func)
+        from .taint_result import apply_project_boundaries
+        apply_project_boundaries(result, self.project_context.metadata())
+        return self.project_context.annotate(result)
 
     # -- shared resolution ------------------------------------------------
 
@@ -370,7 +487,7 @@ class TaintEngine:
         MLIL, so a MLIL-only scan misses the motivating case). Cached per function
         start; defensive so the synthetic test fakes (no LLIL) just see the MLIL
         scan. Lets forward taint flag an otherwise-silent dataflow hole (#206)."""
-        key = int(getattr(func, "start", 0))
+        key = self._function_key(func)
         if key in self._unimpl_cache:
             return self._unimpl_cache[key]
         addrs: set[int] = set()
@@ -671,12 +788,14 @@ class TaintEngine:
         return pointer."""
         if d is None or "CALL" not in op_name(d):
             return None
+        if self._returned_buffer_key(d) in self._project_return_buffers:
+            return self._returned_buffer_key(d)
         callee = self._callee_name(self._resolve_direct_target(d)) or ""
         callee_nm = callee.split("@", 1)[0].lstrip("_").lower()
         if (any(tok in callee_nm for tok in self._ALLOC_NAME_HINTS)
                 or self._dest_alloc(ssaf, var)[0] is not None
                 or self._model_declares_returned_buffer(callee)):
-            return ("heap", int(getattr(d, "address", 0)))
+            return self._returned_buffer_key(d)
         return None
 
     def _model_declares_returned_buffer(self, callee: str | None) -> bool:
@@ -698,15 +817,14 @@ class TaintEngine:
         toks += [s.get("to") for s in (model.get("sources") or [])]
         return "*ret" in toks
 
-    @staticmethod
-    def _returned_buffer_key(ins: Any) -> tuple:
+    def _returned_buffer_key(self, ins: Any) -> tuple:
         """The buffer identity a model-declared buffer return ('*ret') is keyed
         by: the CALL SITE itself, in the ``("heap", addr)`` space
         :meth:`_heap_buffer_key` produces for allocator calls (and the store path
         keys through). One definition shared by every place a model's ``'*ret'``
         token is applied, so the key a model creates is always the key a later
         pointer re-resolves to through :meth:`_recognized_alloc_key`."""
-        return ("heap", int(getattr(ins, "address", 0)))
+        return self._memory_key("heap", int(getattr(ins, "address", 0)))
 
     @staticmethod
     def _key_tainted(key: Any, tainted: set) -> bool:
@@ -1184,7 +1302,7 @@ class TaintEngine:
             return (var_key(pv), var_label(pv))
         ga = self._global_addr(ssaf, expr)
         if ga is not None:
-            return (("global", ga), f"glob_{hex(ga)}")
+            return (self._memory_key("global", ga), f"glob_{hex(ga)}")
         hk = self._heap_buffer_key(ssaf, expr)
         if hk is not None:
             return (hk, f"heap_{hex(hk[1])}")
@@ -1401,7 +1519,7 @@ class TaintEngine:
                     val = getattr(a, "value", None)
                     c = getattr(val, "value", val)
                 try:
-                    return (("gload", int(c)), 0)
+                    return (self._memory_key("gload", int(c)), 0)
                 except (TypeError, ValueError):
                     return None
             return None
@@ -1417,7 +1535,7 @@ class TaintEngine:
                 val = getattr(expr, "value", None)
                 c = getattr(val, "value", val)
             try:
-                return (("gconst", int(c)), 0)
+                return (self._memory_key("gconst", int(c)), 0)
             except (TypeError, ValueError):
                 return None
         if op in ("MLIL_ADD", "MLIL_SUB"):
@@ -1538,14 +1656,14 @@ class TaintEngine:
             return (var_key(v), off)
         if "CONST_PTR" in op:
             c = self._int_const(expr)
-            return (("gconst", c), 0) if c is not None else None
+            return (self._memory_key("gconst", c), 0) if c is not None else None
         if "LOAD" in op:
             a = getattr(expr, "src", None)
             c = self._int_const(a) if a is not None and "CONST_PTR" in op_name(a) else None
             if c is None or not self._pointer_width(getattr(expr, "size", None)) \
                     or "_STRUCT" in op:
                 return None
-            return (("gload", c, getattr(expr, "src_memory", None)), 0)
+            return (self._memory_key("gload", c, getattr(expr, "src_memory", None)), 0)
         if op in ("MLIL_ADD", "MLIL_SUB"):
             left, right = getattr(expr, "left", None), getattr(expr, "right", None)
             rc, lc = self._int_const(right), self._int_const(left)
@@ -1962,6 +2080,8 @@ class TaintEngine:
         reload on every sweep (#1053 review 5)."""
         start = getattr(getattr(ssaf, "source_function", None), "start", None)
         fkey = ("fn", start) if isinstance(start, int) else ("ssa", id(ssaf))
+        if self.project_context is not None:
+            fkey += (self.project_context.file_id(self.bv),)
         holder = self._slot_proofs.get(fkey)
         if holder is None or (fkey[0] == "ssa" and holder[0] is not ssaf):
             holder = (ssaf, {})
@@ -2040,6 +2160,41 @@ class TaintEngine:
                 if i is not None and i not in out:
                     out.append(i)
         return out
+
+    @staticmethod
+    def _model_backward_inputs(model, param_count, *, destinations=(), out_indices=None):
+        """Shared backward model grammar for return and output-byte producers."""
+        def matches(token):
+            token = str(token or "")
+            return (_try_arg_index(token) in out_indices if out_indices is not None
+                    else token in destinations)
+
+        inputs = []
+        for rule in model.get("propagates") or []:
+            if not matches(rule.get("to")):
+                continue
+            token = str(rule.get("from") or "")
+            index = _try_arg_index(token)
+            item = (index, token.startswith("*"))
+            if index is not None and index < param_count and item not in inputs:
+                inputs.append(item)
+        varargs = model.get("varargs")
+        if varargs is not None and matches(varargs.get("to")):
+            for index in range(max(int(varargs.get("first_index", 0)), 0), param_count):
+                if not any(i == index for i, _ in inputs):
+                    inputs.append((index, True))
+        is_source = any(matches(rule.get("to")) for rule in model.get("sources") or [])
+        lengths = []
+        if out_indices is not None:
+            # A bounded fill's length affects the bytes, independently of its
+            # source operand (including when those source bytes are constant).
+            sink = model.get("sink") or {}
+            if sink.get("len_arg") is not None:
+                lengths = [int(sink["len_arg"])]
+            elif str(sink.get("class") or "") in ("overflow_len", "fortified_overflow"):
+                lengths = [int(i) for i in sink.get("tainted_args") or [] if isinstance(i, int)]
+            lengths = [i for i in lengths if i < param_count and not any(j == i for j, _ in inputs)]
+        return inputs, is_source, lengths
 
     def _mem_in(self, ins: Any) -> int | None:
         """The memory-SSA version *ins* READS (the state before it executes).
@@ -2722,30 +2877,9 @@ class TaintEngine:
             hit = [i for i in outs if i in yes]
             if not hit:
                 return None
-            from_idxs: list[int] = []
-            for rule in model.get("propagates") or []:
-                if _try_arg_index(str(rule.get("to") or "")) in hit:
-                    fi = _try_arg_index(str(rule.get("from") or ""))
-                    if fi is not None and fi < len(params) and fi not in from_idxs:
-                        from_idxs.append(fi)
-            va = model.get("varargs")
-            if va is not None and _try_arg_index(str(va.get("to") or "")) in hit:
-                for fi in range(max(int(va.get("first_index", 0)), 0), len(params)):
-                    if fi not in from_idxs:
-                        from_idxs.append(fi)
-            is_source = any(
-                _try_arg_index(str(s.get("to") or "")) in hit
-                for s in (model.get("sources") or []))
-            # The length operand(s) of a bounded fill decide how many of the
-            # input bytes land in the buffer -- `memcpy(buf, "lit", n)` with a
-            # tainted n cuts the command (round 3 P3).
-            sink = model.get("sink") or {}
-            len_idxs: list[int] = []
-            if sink.get("len_arg") is not None:
-                len_idxs = [int(sink["len_arg"])]
-            elif str(sink.get("class") or "") in ("overflow_len", "fortified_overflow"):
-                len_idxs = [int(i) for i in (sink.get("tainted_args") or []) if isinstance(i, int)]
-            len_idxs = [i for i in len_idxs if i < len(params) and i not in from_idxs]
+            inputs, is_source, len_idxs = self._model_backward_inputs(
+                model, len(params), out_indices=hit)
+            from_idxs = list(dict.fromkeys(i for i, _ in inputs))
             writers.append(("fill", defn, mkey or name, params, from_idxs, is_source,
                             len_idxs, callee))
             if 0 not in hit:
@@ -3137,8 +3271,9 @@ class TaintEngine:
         mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
         if mapped:
             return list(mapped), "agent-map"
-        cands = self._call_targets_from_pvs(
-            getattr(getattr(ins, "dest", None), "possible_values", None))
+        cands = (self.project_context.indirect_targets(self.bv, ins)
+                 if self.project_context is not None else self._call_targets_from_pvs(
+                     getattr(getattr(ins, "dest", None), "possible_values", None)))
         return (cands, "value-set") if cands else ([], None)
 
     def _indirect_target_matches(self, ins: Any, callee: str, *,
@@ -3299,8 +3434,9 @@ class TaintEngine:
             result = self._forward_run(func, sources, max_depth=max_depth)
             if len(sources) > 1 and result["reached_sinks"]:
                 self._attribute_sources(func, sources, result, max_depth=max_depth)
-            return result
-        return self._forward_attributed(func, sources, callsite_addrs, max_depth=max_depth)
+            return self._project_finish(result, func)
+        return self._project_finish(
+            self._forward_attributed(func, sources, callsite_addrs, max_depth=max_depth), func)
 
     def _attribute_sources(self, func: Any, sources: list[dict[str, Any]],
                            result: dict[str, Any], *, max_depth: int) -> None:
@@ -3326,6 +3462,8 @@ class TaintEngine:
             for f in solo["reached_sinks"]:
                 s = f.get("sink") or {}
                 key = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+                if self.project_context is not None:
+                    key += (s.get("project_file_id"),)
                 if loc not in reached.setdefault(key, []):
                     reached[key].append(loc)
         for f in result["reached_sinks"]:
@@ -3333,8 +3471,10 @@ class TaintEngine:
             if sig.get("source") != "multiple":
                 continue
             s = f.get("sink") or {}
-            candidates = reached.get(
-                (s.get("callee"), s.get("address"), s.get("tainted_arg_index")), [])
+            key = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+            if self.project_context is not None:
+                key += (s.get("project_file_id"),)
+            candidates = reached.get(key, [])
             f["source_candidates"] = candidates
             if len(candidates) == 1:
                 f["signature"] = _make_signature(
@@ -3354,6 +3494,7 @@ class TaintEngine:
         self._funcs_visited: set[int] = set()
         self._max_depth_seen = 0
         self._truncated = False
+        self._project_return_buffers.clear()
         # #579/#576 review: taint truncation has DISTINCT causes that consumers
         # must tell apart -- an intra-function fixpoint that exhausts its
         # iteration budget ('fixpoint_exhausted') vs an interprocedural descent
@@ -3398,6 +3539,8 @@ class TaintEngine:
         for f in sub["findings"]:
             s = f.get("sink", {})
             sig = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+            if self.project_context is not None:
+                sig += (s.get("project_file_id"),)
             if sig in seen_sink:
                 continue
             seen_sink.add(sig)
@@ -3572,6 +3715,8 @@ class TaintEngine:
         for f in union_findings:
             s = f.get("sink", {})
             sig = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+            if self.project_context is not None:
+                sig += (s.get("project_file_id"),)
             if sig in seen_sink:
                 continue
             seen_sink.add(sig)
@@ -3672,7 +3817,7 @@ class TaintEngine:
         """``follow_thunk`` memoized per resolved function start address."""
         if fn is None:
             return None
-        key = int(getattr(fn, "start", 0))
+        key = self._function_key(fn)
         cache = self._thunk_cache
         if key in cache:
             return cache[key]
@@ -4107,6 +4252,10 @@ class TaintEngine:
                 continue
             if not any(self._reaches_avoiding(f, ins, []) is not False for f in fills):
                 continue
+            if self.project_context is not None:
+                resolved = self._project_call(ins)
+                if resolved.status == "resolved":
+                    continue
             at = hex(int(getattr(ins, "address", 0)))
             add_leaf({
                 "kind": "indirect_call_unchecked",
@@ -4857,14 +5006,27 @@ class TaintEngine:
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
         """Analyze *callee* with the given tainted parameter indices, caching the
         result per (callee, tainted-param-set) so it is computed once."""
-        key = (int(callee.start), param_set)
+        key = (self._function_key(callee), param_set)
         if key in self._cache:
             cached = self._cache[key]
             if cached is None:  # in-progress -> recursion cycle
+                if self.project_context is not None:
+                    self.project_context.boundary(
+                        "taint_recursion", bv=self._function_view(callee),
+                        address=int(callee.start), detail="summary cycle stopped body descent")
                 return {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
                         "assumptions": [f"recursion cycle at {self._prose_function(callee)}; return conservatively tainted"],
                         "frontier": "recursion cycle stopped descent"}
             return cached
+        if self.project_context is not None and key[0] not in self._funcs_visited:
+            limit = getattr(self.project_context, "limits", {}).get("max_functions", 4096)
+            if len(self._funcs_visited) >= limit:
+                self.project_context.boundary(
+                    "function_limit", bv=self._function_view(callee), address=int(callee.start))
+                self._truncated = True
+                self._truncation_causes.add("project")
+                return {"reached_return": True, "out_params": param_set, "findings": [],
+                        "leaves": [], "assumptions": [], "frontier": "project function limit"}
         self._cache[key] = None  # mark in-progress (cycle guard)
         locators = [{"kind": "param", "index": i} for i in sorted(param_set)]
         # _run_forward(callee) repoints self._bt_func_token at the callee; restore
@@ -4886,8 +5048,7 @@ class TaintEngine:
         self._cache[key] = sub
         return sub
 
-    @staticmethod
-    def _frontier_leaf(ins: Any, callee_fn: Any, tainted_arg_indices, note: str) -> dict[str, Any]:
+    def _frontier_leaf(self, ins: Any, callee_fn: Any, tainted_arg_indices, note: str) -> dict[str, Any]:
         """An honest "taint stopped here" leaf for an unmodeled in-binary callee
         that was NOT descended into (no mappable params, depth bound, recursion
         cycle, or an unanalyzable body). Extends the existing leaves[] honesty
@@ -4895,9 +5056,11 @@ class TaintEngine:
         return {
             "kind": "unmodeled_callee",
             "address": hex(int(getattr(ins, "address", 0))),
-            "callee": {"name": str(getattr(callee_fn, "name", "?")),
-                       "display_name": _display_name(callee_fn) or "?",
-                       "address": hex(int(getattr(callee_fn, "start", 0)))},
+            "callee": self._project_row(
+                {"name": str(getattr(callee_fn, "name", "?")),
+                 "display_name": _display_name(callee_fn) or "?",
+                 "address": hex(int(getattr(callee_fn, "start", 0)))},
+                bv=self._function_view(callee_fn), func=callee_fn),
             "tainted_args": sorted(tainted_arg_indices),
             "note": note,
         }
@@ -5073,8 +5236,11 @@ class TaintEngine:
         note = f"calls {self._prose_function(callee_fn)} with tainted arg(s) {sorted(valid)}"
         if via:
             note = f"[{via}-resolved] " + note
-        prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
-                                  callee=getattr(callee_fn, "name", None)))
+        prefix.append(self._instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
+                                      callee=getattr(callee_fn, "name", None)))
+        if self.project_context is not None:
+            prefix[-1]["target"] = self.project_context.identity(
+                self._function_view(callee_fn), function=callee_fn)
         out["handoff_node"] = [n for i in sorted(valid) for n in tainted_args[i]]
         for f in sub["findings"]:
             rebuilt = {"sink": f["sink"], "path": prefix + f["path"]}
@@ -5106,6 +5272,10 @@ class TaintEngine:
         out["reached_return"] = sub["reached_return"]
         out["out_params"] = sub.get("out_params", frozenset())
         out["out_param_elems"] = sub.get("out_param_elems", frozenset())
+        if self.project_context is not None:
+            out["return_buffer"] = sub.get("return_buffer", False)
+            out["return_path"] = prefix + sub.get("return_path", [])
+            out["out_paths"] = {i: prefix + path for i, path in sub.get("out_paths", {}).items()}
         if not sub["reached_return"]:
             lost = self._valueless_return_leaf(ins, callee_fn, tainted_args, caller_instrs)
             if lost is not None:
@@ -5322,11 +5492,12 @@ class TaintEngine:
         the module-level :func:`targets_from_pvs`)."""
         return targets_from_pvs(pvs)
 
+    @_in_function_view
     def _run_forward(self, func: Any, locators: list[dict[str, Any]], depth: int,
                      max_depth: int, *, top: bool) -> dict[str, Any]:
         ssaf = self._ssa_func(func)
         instrs = self._instrs(ssaf)
-        self._funcs_visited.add(int(getattr(func, "start", 0)))
+        self._funcs_visited.add(self._function_key(func))
         self._max_depth_seen = max(self._max_depth_seen, depth)
         # Scope the structural _buffer_target cache to THIS function so a callee's
         # expr_index can't collide with a caller's (#420). _summarize saves/restores
@@ -5335,7 +5506,7 @@ class TaintEngine:
         # `is not None` -- only a genuinely absent start (a degenerate fake) leaves
         # the token None and makes _buffer_target bypass the cache.
         _start = getattr(func, "start", None)
-        self._bt_func_token = int(_start) if _start is not None else None
+        self._bt_func_token = self._function_key(func) if _start is not None else None
 
         tainted: set[tuple] = set()
         why: dict[tuple, dict[str, Any]] = {}
@@ -5387,6 +5558,9 @@ class TaintEngine:
         def ins_key(i: Any) -> int:
             return int(getattr(i, "instr_index", getattr(i, "address", 0)))
         reached_return = False
+        return_buffer = False
+        return_path: list[dict] = []
+        out_paths: dict[int, list[dict]] = {}
 
         def add_assumption(msg: str) -> None:
             if msg not in assumptions:
@@ -6364,6 +6538,13 @@ class TaintEngine:
                     if (read_taint(ins) or any(arg_taint(src) for src in srcs)
                             or self._return_buffer_tainted(ssaf, ins, tainted)):
                         reached_return = True
+                        if self.project_context is not None:
+                            return_buffer |= self._return_buffer_tainted(ssaf, ins, tainted)
+                            hits = read_taint(ins) or [
+                                h for src in srcs for h in arg_taint(src)]
+                            if not return_path:
+                                return_path = (self._reconstruct_path(hits[0], why) if hits else [])
+                                return_path.append(self._instr_dict(ins, reason="tainted return"))
                     continue
 
                 if self._is_call(ins):
@@ -6393,6 +6574,11 @@ class TaintEngine:
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
                                 changed = True
+                            if self.project_context is not None and pidx is not None:
+                                hits = [h for p in params for h in arg_taint(p)]
+                                out_paths[pidx] = (
+                                    self._reconstruct_path(hits[0], why) if hits else []) + [
+                                    self._instr_dict(ins, reason=f"model writes out-param {pidx}")]
                         # Deliberately NO `continue` here (#807). A model is an
                         # overLAY on a callee this binary may also have a body for,
                         # not a summary that replaces it: the walk used to stop at
@@ -6430,8 +6616,11 @@ class TaintEngine:
                         continue
                     processed_calls.add(call_key)
 
+                    bound_call = None
                     if target is not None:
                         candidates, via = [target], None
+                    elif self.project_context is not None:
+                        candidates, via = self._indirect_call_resolution(ins)
                     else:
                         mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
                         if mapped:
@@ -6441,6 +6630,15 @@ class TaintEngine:
                             candidates = self._call_targets_from_pvs(
                                 getattr(getattr(ins, "dest", None), "possible_values", None))
                             via = "value-set" if candidates else None
+                    if not candidates and self.project_context is not None:
+                        # GOT/ExternalLocation calls can be bound without a local
+                        # code pointer or a concrete VSA value. Ask the shared
+                        # resolver only after map/VSA candidates have been tried,
+                        # so a successful indirect override leaves no false boundary.
+                        bound_call = self._project_call(ins)
+                        if bound_call.status == "resolved":
+                            candidates = [int(bound_call.address)]
+                            via = "project"
 
                     if not candidates:
                         leaf = {
@@ -6455,6 +6653,9 @@ class TaintEngine:
                         continue
 
                     ret_tainted = False
+                    returned_buffer = False
+                    returned_path: list[dict] = []
+                    output_paths: dict[int, list[dict]] = {}
                     descend_outparams: set[int] = set()
                     descend_outparam_elems: set = set()  # (param_idx, field) #319b
                     resolved_names: list[str] = []
@@ -6462,8 +6663,13 @@ class TaintEngine:
                         # function_at normalizes the Thumb low bit: a value-set
                         # target can be odd while the function lives at taddr&~1
                         # (#89 Problem B).
-                        cfn = function_at(self.bv, taddr)
-                        nm = self._callee_name(taddr)
+                        cfn = function_at(self.bv, taddr) if bound_call is None else None
+                        nm = (self._callee_name(taddr) if bound_call is None
+                              else str(getattr(bound_call.function, "name", "") or ""))
+                        project_call = bound_call or self._project_call(
+                            ins, address=taddr if target is None else None)
+                        if project_call is not None:
+                            cfn = project_call.function if project_call.status == "resolved" else None
                         # Canonical name for the "resolved via ... to:" assumption:
                         # the function/symbol AT the resolved address, captured
                         # BEFORE any thunk re-model reassigns `nm`/`descend_fn`. The
@@ -6494,9 +6700,12 @@ class TaintEngine:
                         # and minting the same false all-clear #807 is about. Descent is
                         # independent of the model: following never costs a model.
                         rnm = rmk = rmd = None
+                        if project_call is not None and cfn is not None:
+                            rnm = str(getattr(cfn, "name", "") or "")
+                            rmk, rmd = lookup_model(self.models, rnm)
                         descend_fn = cfn
                         descend_internal = cfn_internal
-                        if cfn is not None and not cfn_internal:
+                        if cfn is not None and not cfn_internal and self.project_context is None:
                             resolved = self._follow_thunk_cached(cfn)
                             if resolved is not None and resolved is not cfn:
                                 rnm = self._callee_name(int(getattr(resolved, "start", 0))) \
@@ -6516,7 +6725,8 @@ class TaintEngine:
                         # not already internal, and only to a real in-binary
                         # definition -- a model anywhere in the chain already owns
                         # this call's story.
-                        if md is None and rmd is None and not descend_internal:
+                        if (self.project_context is None and md is None and rmd is None
+                                and not descend_internal):
                             local = self._local_definition_for(nm)
                             if local is not None:
                                 descend_fn = local
@@ -6574,6 +6784,11 @@ class TaintEngine:
                             ret_tainted = ret_tainted or d["reached_return"]
                             descend_outparams |= set(d.get("out_params") or ())
                             descend_outparam_elems |= set(d.get("out_param_elems") or ())
+                            if self.project_context is not None:
+                                returned_buffer |= d.get("return_buffer", False)
+                                if d["reached_return"] and not returned_path:
+                                    returned_path = d.get("return_path", [])
+                                output_paths.update(d.get("out_paths", {}))
                         elif md is None and rmd is None:
                             # Genuinely unmodeled: no model anywhere in the chain (the
                             # call site's own included), so the conservative external
@@ -6666,6 +6881,25 @@ class TaintEngine:
 
                     if ret_tainted and cons_return(ins, "return of resolved call propagates taint"):
                         changed = True
+                    if self.project_context is not None:
+                        for w in ssa_writes(ins):
+                            rec = why.get((var_key(w), getattr(w, "version", None)))
+                            if rec is not None and returned_path:
+                                rec["provider_path"] = returned_path
+                        if returned_buffer:
+                            hk = self._returned_buffer_key(ins)
+                            if hk not in self._project_return_buffers:
+                                self._project_return_buffers.add(hk)
+                                self._bt_cache.clear()
+                            if taint_node((hk, None), f"heap_{hex(hk[1])}", ins,
+                                          "buffer returned by analyzed provider", []):
+                                changed = True
+                            if returned_path:
+                                why[(hk, None)]["provider_path"] = returned_path
+                        if "TAILCALL" in opn and ret_tainted:
+                            return_buffer |= returned_buffer
+                            if not return_path:
+                                return_path = returned_path
                     # callee wrote tainted data through pointer arg(s) -> taint the
                     # caller's buffer, and bubble up if that buffer is our own param
                     for j in descend_outparams:
@@ -6674,10 +6908,22 @@ class TaintEngine:
                             if pv is not None and taint_node((var_key(pv), None), var_label(pv), ins,
                                                              f"out-param {j} written by callee", []):
                                 changed = True
+                            if self.project_context is not None:
+                                bt = self._buffer_target(ssaf, params[j])
+                                if bt is not None:
+                                    node = (bt[0], None)
+                                    if taint_node(node, bt[1], ins,
+                                                  f"out-param {j} written by analyzed provider", []):
+                                        changed = True
+                                    if output_paths.get(j):
+                                        why[node]["provider_path"] = output_paths[j]
                             pidx = self._resolve_to_param_index(func, ssaf, params[j])
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
                                 changed = True
+                            if self.project_context is not None and pidx is not None:
+                                out_paths[pidx] = output_paths.get(j, [
+                                    self._instr_dict(ins, reason=f"provider writes out-param {pidx}")])
                     # #319b: a callee that filled a descriptor-ARRAY element field of
                     # an array we passed in -> taint the caller-side ("elem", base,
                     # field) key (base resolved on OUR side, so an alloca'd VLA's
@@ -6740,8 +6986,8 @@ class TaintEngine:
                             # mem-SSA can't correlate; match the load's absolute address
                             # against the coarse global taint location instead.
                             ga = self._global_addr(ssaf, getattr(src_expr, "src", None))
-                            if ga is not None and (("global", ga), None) in tainted:
-                                msrc = (("global", ga), None)
+                            if ga is not None and (self._memory_key("global", ga), None) in tainted:
+                                msrc = (self._memory_key("global", ga), None)
                                 reason = "loads from a tainted global buffer (global_approx)"
                                 assume = "global buffer modeled coarsely as one taint location (global_approx)"
                         if msrc is None and buffer_slots:
@@ -6813,6 +7059,12 @@ class TaintEngine:
                                           "store into tainted heap buffer (alloc-site, memory_approx)", reads):
                                 changed = True
                                 add_assumption("heap buffer aliasing modeled coarsely by allocation site (memory_approx)")
+                        elif (self.project_context is not None
+                              and (ga := self._global_addr(ssaf, dest)) is not None):
+                            if taint_node((self._memory_key("global", ga), None),
+                                          f"glob_{hex(ga)}", ins,
+                                          "store into tainted global buffer (global_approx)", reads):
+                                changed = True
                         elif (ek := elem_key(ins, dest)) is not None:
                             # #319b: a tainted store to a descriptor-ARRAY element
                             # field `[base + idx*stride + field]` -- key it by
@@ -6840,6 +7092,9 @@ class TaintEngine:
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
                                 changed = True
+                            if self.project_context is not None and pidx is not None:
+                                out_paths[pidx] = self._reconstruct_path(reads[0], why) + [
+                                    self._instr_dict(ins, reason=f"writes out-param {pidx}")]
                             # T1: _pointee_var could not correlate the store
                             # destination to a tracked buffer (a struct-field
                             # pointer and/or a non-constant index), so the engine
@@ -7053,7 +7308,8 @@ class TaintEngine:
         return {"reached_return": reached_return, "out_params": frozenset(out_params),
                 "out_param_elems": frozenset(out_param_elems),
                 "findings": findings, "leaves": leaves, "assumptions": assumptions,
-                "diag": diag}
+                "diag": diag, **({"return_buffer": return_buffer, "return_path": return_path,
+                                 "out_paths": out_paths} if self.project_context is not None else {})}
 
     def _reason_for(self, opn: str) -> str:
         if "PHI" in opn:
@@ -7740,8 +7996,8 @@ class TaintEngine:
             ins = entry.get("instr")
             parents = entry.get("parents") or []
             if ins is not None:
-                step = _instr_dict(ins, reason=entry.get("reason"),
-                                   tainted=[entry.get("label", "?")])
+                step = self._instr_dict(ins, reason=entry.get("reason"),
+                                        tainted=[entry.get("label", "?")])
                 # #827: this walk follows ONE predecessor per step, but a value
                 # defined at a branch join (a PHI of two tainted parents, e.g.
                 # `x = cond ? a : b`) has several. Rendering parents[0] alone
@@ -7754,11 +8010,272 @@ class TaintEngine:
                 if len(parents) > 1:
                     step["alternate_parents"] = len(parents) - 1
                 chain.append(step)
+            if self.project_context is not None and entry.get("provider_path"):
+                chain.extend(reversed(entry["provider_path"]))
             cur = parents[0] if parents else None
         chain.reverse()
         return chain
 
     # -- backward ---------------------------------------------------------
+
+    def _bw_project_boundary(self, reason, func, ins=None, **detail):
+        """Keep project traversal stops in the shared completeness channel."""
+        self.project_context.boundary(
+            reason, bv=self._function_view(func),
+            address=int(getattr(ins, "address", getattr(func, "start", 0))),
+            detail=detail or None)
+
+    def _bw_project_function(self, func, ins=None):
+        if self.project_context is None:
+            return True
+        visited = getattr(self, "_bw_project_functions", None)
+        if visited is None:
+            visited = self._bw_project_functions = set()
+        key = self._function_key(func)
+        if key in visited:
+            return True
+        limit = getattr(self.project_context, "limits", {}).get("max_functions", 4096)
+        if len(visited) >= limit:
+            self._bw_project_boundary("function_limit", func, ins, limit=limit)
+            return False
+        visited.add(key)
+        return True
+
+    def _bw_sink_sites(self, instrs, sink):
+        # Trace supplies an exact instruction, including unresolved indirect
+        # calls. This selector is deliberately project-only.
+        address = sink.get("address")
+        if self.project_context is not None and address is not None:
+            address = int(address, 0) if isinstance(address, str) else int(address)
+            return [i for i in instrs if self._is_call(i)
+                    and int(getattr(i, "address", 0)) == address]
+        return self._find_callsites(
+            instrs, str(sink.get("callee") or ""), resolve_indirect=True)
+
+    def _bw_project_edge(self, caller, call, callee, reason):
+        row = self._project_row(
+            _instr_dict(call, reason=reason), bv=self._function_view(caller), func=caller)
+        row["source"] = self.project_context.identity(
+            self._function_view(caller), caller, int(getattr(call, "address", 0)))
+        row["target"] = self.project_context.identity(self._function_view(callee), callee)
+        row["cross_file"] = row["source"]["project_file_id"] != row["target"]["project_file_id"]
+        return row
+
+    def _bw_project_model(self, func, call, callee, depth, max_depth, visited,
+                          invocation, *, out_index, demand, reads_memory, applied_model_key=None):
+        """Apply a distinct canonical-provider overlay in the caller's operands.
+
+        Import aliases and provider symbols can carry different models. The
+        ordinary caller walk applies the alias model; this adds the provider's
+        model without substituting either model for the provider body.
+        """
+        name = str(getattr(callee, "name", "") or "")
+        key, model = lookup_model(self.models, name)
+        if model is None:
+            return []
+        destinations = ({"ret", "*ret"} if out_index is None
+                        else {f"*arg:{out_index}"})
+        if key == applied_model_key:
+            # The caller return walker applies sources and ordinary ->ret
+            # rules (unless its source branch wins), but not *ret or varargs.
+            model = {
+                "propagates": [rule for rule in model.get("propagates") or []
+                               if model.get("sources") or rule.get("to") == "*ret"],
+                "varargs": model.get("varargs"),
+            }
+        params = self._call_params(call)
+        inputs, is_source, lengths = self._model_backward_inputs(
+            model, len(params), destinations=destinations,
+            out_indices={out_index} if out_index is not None else None)
+        edge = self._bw_project_edge(
+            func, call, callee,
+            f"canonical provider model {key}: "
+            + ("return" if out_index is None else f"writes argument {out_index}"))
+        results = []
+        if is_source:
+            origin = self.project_context.identity(self._function_view(callee), callee)
+            origin.update(kind="source", callee=key or name,
+                          callsite=self.project_context.identity(
+                              self.bv, func, int(getattr(call, "address", 0))))
+            results.append({"steps": [edge], "origin": origin,
+                            "crossed": [str(callee.name)]})
+        if (out_index is not None and not is_source and not inputs and not lengths
+                and f"*arg:{out_index}" in (model.get("writes") or [])):
+            origin = self.project_context.identity(self._function_view(callee), callee)
+            origin.update(kind="call", callee=key or name)
+            results.append({"steps": [edge], "origin": origin,
+                            "crossed": [str(callee.name)]})
+        for index, pointee in inputs + [(i, False) for i in lengths]:
+            anchor = None
+            if pointee or reads_memory:
+                anchor = (params[index], None if pointee and reads_memory
+                          else demand if reads_memory else 0)
+            for sub in self._backward_slice(
+                    func, None, depth, max_depth, visited, seed_ins=call,
+                    seed_expr=params[index], invocation=invocation, anchor=anchor):
+                results.append({"steps": sub["steps"] + [edge],
+                                "origin": sub["origin"],
+                                "crossed": [str(callee.name)] + sub["crossed"]})
+        return results
+
+    def _bw_project_descend(self, func, call, depth, max_depth, visited,
+                            invocation, *, out_index=None, demand=None, reads_memory=False,
+                            applied_model_key=None):
+        """Slice actual return expressions or an output object's exit memory.
+
+        An invocation frame binds provider parameters to THIS caller operand;
+        it is not a reverse-index search. Models are handled by the ordinary
+        walk alongside these body-derived paths.
+        """
+        candidates, _ = self._indirect_call_resolution(call)
+        resolved = ([self._project_call(call, address=a) for a in candidates]
+                    if candidates else [self._project_call(call)])
+        results = []
+        seen = set()
+        for target in resolved:
+            callee = target.function
+            if target.status != "resolved" or callee is None:
+                self._bw_project_boundary(
+                    target.reason or "backward_provider_unresolved", func, call,
+                    status=target.status, target=target.target)
+                continue
+            key = self._function_key(callee)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.extend(self._bw_project_model(
+                func, call, callee, depth, max_depth, visited, invocation,
+                out_index=out_index, demand=demand, reads_memory=reads_memory,
+                applied_model_key=applied_model_key))
+            active = visited | {self._function_key(func)}
+            if depth >= max_depth or key in active:
+                self._bw_project_boundary(
+                    "backward_depth_limit" if depth >= max_depth else "backward_recursion",
+                    func, call, target=target.target)
+                continue
+            edge = self._bw_project_edge(
+                func, call, callee,
+                "provider return" if out_index is None else f"provider writes argument {out_index}")
+            frame = (func, call, invocation, visited)
+            with self._view_scope(callee):
+                if not self._bw_project_function(callee):
+                    continue
+                try:
+                    ssaf = self._ssa_func(callee)
+                    instrs = self._instrs(ssaf)
+                except TaintError as exc:
+                    self._bw_project_boundary("backward_missing_body", callee, detail=str(exc))
+                    continue
+                exits = [i for i in instrs if op_name(i) == "MLIL_RET"
+                         or "TAILCALL" in op_name(i)]
+                if not exits:
+                    self._bw_project_boundary("backward_missing_return", callee)
+                    continue
+                root = None
+                if out_index is not None:
+                    root = next((r for i in instrs for r in ssa_reads(i)
+                                 if self._param_index_of(callee, r) == out_index
+                                 and getattr(r, "version", None) == 0), None)
+                    if root is None:
+                        self._bw_project_boundary(
+                            "backward_parameter_unavailable", callee, index=out_index)
+                        continue
+                for ret in exits:
+                    if out_index is not None:
+                        subs = self._backward_slice(
+                            callee, root, depth + 1, max_depth, active,
+                            seed_ins=ret, invocation=frame, writer_seed=True,
+                            anchor=(root, demand))
+                    elif "TAILCALL" in op_name(ret):
+                        subs = self._bw_project_descend(
+                            callee, ret, depth + 1, max_depth, active, frame,
+                            demand=demand, reads_memory=reads_memory)
+                    else:
+                        values = getattr(ret, "src", None)
+                        values = values if isinstance(values, (list, tuple)) else [values]
+                        subs = []
+                        for value in values:
+                            if value is None:
+                                continue
+                            subs.extend(self._backward_slice(
+                                callee, None, depth + 1, max_depth, active,
+                                seed_ins=ret, seed_expr=value, invocation=frame,
+                                anchor=(value, demand) if reads_memory else None))
+                        if not subs:
+                            self._bw_project_boundary("backward_return_value_unavailable", callee, ret)
+                    for sub in subs:
+                        results.append({
+                            "steps": sub["steps"] + [edge],
+                            "origin": sub["origin"],
+                            "crossed": [str(callee.name)] + sub["crossed"],
+                        })
+        return results
+
+    def _bw_project_callers(self, func, terminal_params, depth, max_depth,
+                            visited, base_steps, param_demands, invocation):
+        """Translate parameter origins, preserving exact descent call context."""
+        if invocation is None:
+            sites = self.project_context.callers(self.bv, func)
+            calls = [(s.function, s.instruction, None, visited) for s in sites[:MAX_CALLERS]]
+        else:
+            calls = [invocation]
+            sites = calls
+        results = []
+        followed_sites = set()
+        for pidx, pvar in terminal_params.items():
+            followed = False
+            for ordinal, (caller, call, parent_frame, caller_visited) in enumerate(calls):
+                if invocation is None and self._function_key(caller) in visited:
+                    self._bw_project_boundary("backward_recursion", caller, call)
+                    continue
+                with self._view_scope(caller):
+                    if invocation is None:
+                        # Reverse-index instructions are ordinary MLIL. Never
+                        # feed their non-SSA operands into the SSA def walker.
+                        try:
+                            ssa_call = getattr(call, "ssa_form", None)
+                            if ssa_call is None:
+                                ssa_call = next((i for i in self._instrs(self._ssa_func(caller))
+                                                 if self._is_call(i)
+                                                 and i.address == call.address), None)
+                        except TaintError as exc:
+                            self._bw_project_boundary(
+                                "backward_missing_body", caller, call, detail=str(exc))
+                            continue
+                        if ssa_call is None:
+                            self._bw_project_boundary("backward_call_ssa_unavailable", caller, call)
+                            continue
+                        call = ssa_call
+                    params = self._call_params(call)
+                    if pidx >= len(params):
+                        self._bw_project_boundary(
+                            "backward_argument_unavailable", caller, call, index=pidx)
+                        continue
+                    value = params[pidx]
+                    edge = self._bw_project_edge(caller, call, func, f"passed as arg {pidx} to {func.name}")
+                    try:
+                        subs = self._backward_slice(
+                            caller, None, depth + 1, max_depth, caller_visited,
+                            seed_ins=call, seed_expr=value, invocation=parent_frame,
+                            anchor=(value, param_demands[pidx]) if pidx in param_demands else None)
+                    except TaintError as exc:
+                        self._bw_project_boundary("backward_missing_body", caller, call, detail=str(exc))
+                        continue
+                    for sub in subs:
+                        results.append({
+                            "steps": sub["steps"] + [edge] + base_steps,
+                            "origin": sub["origin"],
+                            "crossed": [str(func.name)] + sub["crossed"],
+                        })
+                        followed = True
+                        followed_sites.add(ordinal)
+            if not followed:
+                results.append({"steps": base_steps, "origin": self._project_row(
+                    {"kind": "parameter", "index": pidx, "var": var_label(pvar)}, func=func),
+                    "crossed": []})
+        if len(sites) > MAX_CALLERS:
+            self._bw_note_caller_cap(func, len(sites), MAX_CALLERS, len(followed_sites))
+        return results
 
     def backward(self, func: Any, sinks: list[dict[str, Any]], *, max_depth: int = 8) -> dict[str, Any]:
         self._bw_leaves: list[dict[str, Any]] = []
@@ -7770,6 +8287,8 @@ class TaintEngine:
         # full one.
         self._bw_truncated = False
         self._bw_truncation_causes: set[str] = set()
+        if self.project_context is not None:
+            self._bw_project_functions = {self._function_key(func)}
         slices: list[dict[str, Any]] = []
 
         # Function-level resolution is sink-independent: a missing MLIL/SSA form
@@ -7855,6 +8374,8 @@ class TaintEngine:
                         o = sl["origin"]
                         key = (seed_label, sink_addr, o.get("kind"), o.get("var"),
                                o.get("value"), o.get("callee"), o.get("index"))
+                        if self.project_context is not None:
+                            key += (o.get("project_file_id"), o.get("address"))
                         rep = seen_origin.get(key)
                         if rep is not None:
                             rep["reached_via_call_sites"] = rep.get("reached_via_call_sites", 1) + 1
@@ -7915,6 +8436,7 @@ class TaintEngine:
                     "detail": (f"the sink {format_locator(s)} was not sliced ({msg}), so "
                                f"this multi-sink result does not account for it and is "
                                f"NOT complete")}
+            self._project_row(leaf, func=func)
             if leaf not in self._bw_leaves:
                 self._bw_leaves.append(leaf)
 
@@ -7936,7 +8458,7 @@ class TaintEngine:
             _og = sl.get("origin")
             if isinstance(_og, dict) and _og.get("callee"):
                 sl["origin_callee_display_name"] = self._display_for_name(_og["callee"])
-        return {
+        result = {
             "direction": "backward",
             "function": {"name": str(func.name), "display_name": _display_name(func),
                          "address": hex(int(func.start))},
@@ -7980,20 +8502,99 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
+        return self._project_finish(result, func) if self.project_context is not None else result
 
     def _bw_assume(self, msg: str) -> None:
         if msg not in self._bw_assumptions:
             self._bw_assumptions.append(msg)
 
+    @_in_function_view
     def _backward_slice(self, func: Any, seed_var: Any, depth: int, max_depth: int,
                         visited_funcs: set, seed_ins: Any = None,
-                        anchor: Any = None) -> list[dict[str, Any]]:
+                        anchor: Any = None, *, seed_expr: Any = None,
+                        writer_seed: bool = False, invocation: Any = None) -> list[dict[str, Any]]:
         """Backward def-chain slice within *func*, continuing into callers when it
         bottoms out at a parameter. Returns one slice per origin path. *anchor*
         is the consumer's demand on what the seed points to (``walk``): set for
         an ``arg:`` sink, and for the caller ascent of a parameter the callee
         read through; None when no consumer reads through the seed."""
+        if not self._bw_project_function(func, seed_ins):
+            return [{"steps": [], "origin": {"kind": "unresolved",
+                                            "reason": "function_limit"}, "crossed": []}]
         ssaf = self._ssa_func(func)
+        _instr_dict = self._instr_dict
+        project_slices: list[dict[str, Any]] = []
+        leaf_start = len(self._bw_leaves)
+        source_origins: list[dict[str, Any]] = []
+        project_calls: dict[tuple, bool] = {}
+
+        def _provider(call, *, out_index=None, demand=None, reads_memory=False,
+                      applied_model_key=None):
+            if self.project_context is None:
+                return False
+            key = (getattr(call, "instr_index", None), int(getattr(call, "address", 0)),
+                   out_index, demand, reads_memory, applied_model_key)
+            if key in project_calls:
+                return project_calls[key]
+            subs = self._bw_project_descend(
+                func, call, depth, max_depth, visited_funcs, invocation,
+                out_index=out_index, demand=demand, reads_memory=reads_memory,
+                applied_model_key=applied_model_key)
+            project_calls[key] = bool(subs)
+            project_slices.extend(subs)
+            return bool(subs)
+
+        def _provider_writes(call, base_key):
+            if self.project_context is None or base_key is None:
+                return
+            for idx, operand in enumerate(self._call_params(call)):
+                slot = self._addr_base_offset(ssaf, operand)
+                if ((slot is not None and slot[0] == base_key)
+                        or self._ptr_aliases_local(
+                            ssaf, operand, base_key, escaped=True, escape_addrs={}) != "no"):
+                    _provider(call, out_index=idx)
+
+        memory_definitions: dict[int, list[Any]] = {}
+        provider_objects: set = set()
+
+        def _project_memory_definitions(mv):
+            """Body discovery is independent of model-filtered writer rows."""
+            if mv is None or self.project_context is None:
+                return []
+            if mv in memory_definitions:
+                return memory_definitions[mv]
+            pending, seen, definitions = [mv], set(), []
+            while pending:
+                version = pending.pop()
+                if version is None or version in seen:
+                    continue
+                if len(seen) >= MEM_CHAIN_BUDGET:
+                    self._bw_project_boundary("backward_memory_limit", func, seed_ins)
+                    break
+                seen.add(version)
+                try:
+                    definition = ssaf.get_ssa_memory_definition(version)
+                except Exception as exc:
+                    self._bw_project_boundary(
+                        "backward_memory_unavailable", func, seed_ins, detail=str(exc))
+                    continue
+                if definition is None:
+                    continue
+                definitions.append(definition)
+                pending.extend(self._mem_phi_sources(definition)
+                               if "MEM_PHI" in op_name(definition)
+                               else [self._mem_in(definition)])
+            memory_definitions[mv] = definitions
+            return definitions
+
+        def _project_object_writers(base_key, mv):
+            if self.project_context is None or (base_key, mv) in provider_objects:
+                return
+            provider_objects.add((base_key, mv))
+            for definition in _project_memory_definitions(mv):
+                if self._is_call(definition):
+                    _provider_writes(definition, base_key)
+
         steps: list[dict[str, Any]] = []
         visited_vars: set = set()
         origin = {"kind": "unresolved"}
@@ -8021,6 +8622,10 @@ class TaintEngine:
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
+            if self.project_context is not None and o.get("kind") == "source":
+                self._project_row(o, func=func)
+                if o not in source_origins:
+                    source_origins.append(dict(o))
             if weak is True:
                 rank = 3
             elif weak:
@@ -8055,6 +8660,7 @@ class TaintEngine:
                 "il_text": str(at),
                 "detail": detail,
             }
+            self._project_row(leaf, func=func)
             if leaf not in self._bw_leaves:
                 self._bw_leaves.append(leaf)
 
@@ -8070,6 +8676,63 @@ class TaintEngine:
                 f"that references it with `bn xrefs {hex(addr)}`",
                 **{"global": hex(addr)})
             _set_origin({"kind": "global", "address": hex(addr), "buffer": label})
+
+        def _walk_global_buffer(at, addr, d, mv):
+            """Retain exit-memory provenance without certifying global extent."""
+            base_key = self._memory_key("gconst", addr)
+            key = (base_key, mv)
+            if key in visited_bufs:
+                return
+            visited_bufs.add(key)
+            rows = []
+            for definition in _project_memory_definitions(mv):
+                if "STORE" in op_name(definition):
+                    slot = self._mem_access_slot(ssaf, definition)
+                    if slot is not None and slot[0] == base_key:
+                        rows.append(("store", definition))
+                    continue
+                if not self._is_call(definition):
+                    continue
+                params = self._call_params(definition)
+                touching = []
+                for idx, operand in enumerate(params):
+                    slot = self._addr_base_offset(ssaf, operand)
+                    if slot is not None and slot[0] == base_key:
+                        touching.append(idx)
+                        _provider(definition, out_index=idx)
+                if not touching:
+                    continue
+                name = self._callee_name(const_target(getattr(definition, "dest", None)))
+                mkey, model = lookup_model(self.models, name)
+                if model is None:
+                    continue  # The global frontier still discloses unknown writes.
+                outputs = set(touching) & set(self._model_out_arg_indices(model))
+                if not outputs:
+                    continue
+                inputs = []
+                for rule in model.get("propagates") or []:
+                    if (str(rule.get("to") or "").startswith("*arg:")
+                            and _try_arg_index(str(rule["to"])) in outputs):
+                        idx = _try_arg_index(str(rule.get("from") or ""))
+                        if idx is not None and idx < len(params) and idx not in inputs:
+                            inputs.append(idx)
+                varargs = model.get("varargs")
+                if varargs and _try_arg_index(str(varargs.get("to") or "")) in outputs:
+                    inputs.extend(i for i in range(max(int(varargs.get("first_index", 0)), 0),
+                                                   len(params)) if i not in inputs)
+                source = any(_try_arg_index(str(rule.get("to") or "")) in outputs
+                             for rule in model.get("sources") or [])
+                sink = model.get("sink") or {}
+                lengths = ([int(sink["len_arg"])] if sink.get("len_arg") is not None
+                           else [int(i) for i in sink.get("tainted_args") or []
+                                 if isinstance(i, int)]
+                           if sink.get("class") in ("overflow_len", "fortified_overflow")
+                           else [])
+                lengths = [i for i in lengths if i < len(params) and i not in inputs]
+                rows.append(("fill", definition, mkey or name, params, inputs,
+                             source, lengths, name))
+            _walk_writers({"writers": rows, "truncated": False}, hex(addr), d,
+                          noun="global buffer", base_key=base_key)
 
         def _follow_addresses(at, expr, d, mv, label, subject, anchor=None) -> tuple[bool, bool]:
             """Walk every buffer *expr* is an address INTO, at any offset:
@@ -8087,6 +8750,8 @@ class TaintEngine:
             glob = False
             for addr in addrs:
                 if self._const_ptr_storage(addr) == "writable":
+                    if self.project_context is not None and anchor is not None:
+                        _walk_global_buffer(at, addr, d, mv)
                     _global_leaf(at, label, addr, subject)
                     glob = True
             return bool(locals_), glob
@@ -8173,7 +8838,7 @@ class TaintEngine:
             return (off, off + w, False) if w > 0 else None
 
         def _walk_writers(res, label, d, *, noun="local buffer",
-                          kind="address_of_local_unresolved", value_demand=None):
+                          kind="address_of_local_unresolved", value_demand=None, base_key=None):
             """Put every writer row of a ``_local_buffer_writers`` result in the
             slice and walk its inputs: a store's value (under *value_demand*:
             the stored bytes are data, unless the consumer dereferences what
@@ -8189,6 +8854,8 @@ class TaintEngine:
                 # let a later overwrite of a source buffer (after it had been
                 # copied) pose as the copy's origin (PR-928 review P2).
                 wmv = self._mem_in(wdefn)
+                if wkind in ("opaque", "benign", "fill"):
+                    _provider_writes(wdefn, base_key)
                 if wkind == "store":
                     steps.append(_instr_dict(wdefn, reason=f"store into {noun} {label}"))
                     src = getattr(wdefn, "src", None)
@@ -8237,7 +8904,9 @@ class TaintEngine:
                     steps.append(_instr_dict(
                         wdefn, reason=f"{noun} {label} written by {self._prose_name(mkey)}"))
                     if is_source:
-                        _set_origin({"kind": "source", "callee": mkey})
+                        _set_origin({"kind": "source", "callee": mkey,
+                                     **({"address": hex(int(wdefn.address))}
+                                        if self.project_context is not None else {})})
                     states = [_follow_input(wdefn, params[i], d, wmv, label,
                                             f"input {i} of {self._prose_name(mkey)} writing",
                                             noun=noun)
@@ -8337,9 +9006,10 @@ class TaintEngine:
             if bkey in visited_bufs:
                 return
             visited_bufs.add(bkey)
+            _project_object_writers(var_key(local), mv)
             res = self._local_buffer_writers(ssaf, var_key(local), mv,
                                              base_size=size, region=(lo, hi))
-            _walk_writers(res, label, d, value_demand=value_demand)
+            _walk_writers(res, label, d, value_demand=value_demand, base_key=var_key(local))
             facts = {
                 "region": {"offset": d_lo,
                            "size": (d_hi - d_lo) if d_lo is not None and d_hi is not None
@@ -8470,8 +9140,10 @@ class TaintEngine:
             visited_bufs.add(bkey)
             calls: list = []
             if mv is not None:
+                _project_object_writers(_ssa_root_key(root), mv)
                 res = self._local_buffer_writers(ssaf, _ssa_root_key(root), mv)
-                _walk_writers(res, label, d, noun=_POINTER_NOUN, kind=_POINTER_LEAF)
+                _walk_writers(res, label, d, noun=_POINTER_NOUN, kind=_POINTER_LEAF,
+                              base_key=_ssa_root_key(root))
                 calls = _unproven_calls(res)
             call_txt = ""
             if calls:
@@ -8614,6 +9286,8 @@ class TaintEngine:
             if d > self.max_depth:
                 self._bw_assume(
                     f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
+                if self.project_context is not None:
+                    self._bw_project_boundary("backward_def_chain_limit", func, seed_ins)
                 return
             key = (var_key(v), getattr(v, "version", None),
                    None if anchor is None else (str(anchor[0]), anchor[1]))
@@ -8659,17 +9333,37 @@ class TaintEngine:
                 name = self._callee_name(target)
                 mkey, model = lookup_model(self.models, name)
                 steps.append(_instr_dict(defn, reason=f"defined by call to {name or 'indirect'}"))
+                body_return = False
+                if self.project_context is not None:
+                    dem = _demand_through(anchor, v)
+                    body_return = _provider(
+                        defn, demand=None if dem is None else dem[1],
+                        reads_memory=anchor is not None,
+                        applied_model_key=mkey if model is not None else None)
+                    if body_return and anchor is not None and _is_pointer_typed(v):
+                        # Body-derived return provenance rules out speculative
+                        # aliases to every input, not writes made through the
+                        # returned pointer between this call and its consumer.
+                        _walk_pointer_object(
+                            defn, v, d, mv, f"returned by {self._prose_name(name)}",
+                            before="the caller wrote it")
                 if model and model.get("sources"):
                     origin = {"kind": "source", "callee": mkey or name}
+                    if self.project_context is not None:
+                        origin["address"] = hex(int(defn.address))
+                        self._project_row(origin, func=func)
+                        if origin not in source_origins:
+                            source_origins.append(dict(origin))
                     # A modeled source's returned bytes are the source -- but
                     # a return into an object it was handed -- a local
                     # (`fgets(c, ..)`), a heap allocation, a pointer parameter
                     # -- reads that object, whose bytes no call proves.
                     _returned_object(defn, v, d, mv, anchor, name, model, fresh=False)
-                elif target is None:
+                elif target is None and not body_return:
                     origin = {"kind": "indirect_call", "var": var_label(v)}
                     leaf = {"kind": "indirect_call_unresolved",
                             "address": hex(int(getattr(defn, "address", 0))), "il_text": str(defn)}
+                    self._project_row(leaf, func=func)
                     if leaf not in self._bw_leaves:
                         self._bw_leaves.append(leaf)
                 else:
@@ -8701,7 +9395,9 @@ class TaintEngine:
                             f"argument {fi} of {mkey or name} returned by", arg_dem))
                     if not states:
                         _set_origin({"kind": "call", "callee": name})
-                        _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
+                        if not body_return or model is not None:
+                            _returned_object(defn, v, d, mv, anchor, name, model,
+                                             fresh=not body_return)
                     elif all(s == "literal" for s in states):
                         _set_origin({"kind": "call", "callee": mkey or name}, weak=1)
                 return
@@ -8818,6 +9514,8 @@ class TaintEngine:
             if d > self.max_depth:
                 self._bw_assume(
                     f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
+                if self.project_context is not None:
+                    self._bw_project_boundary("backward_def_chain_limit", func, at)
                 return
             addr = getattr(load, "src", None)
             lmv = getattr(load, "src_memory", None)
@@ -8850,6 +9548,8 @@ class TaintEngine:
             # Exact identity only (#1053 review 1): a narrowed, extended or
             # phi-rooted address has no slot any store can be matched to.
             la = self._mem_access_slot(ssaf, load, exact=True)
+            if la is not None:
+                _project_object_writers(la[0], lmv)
             fixed = self._gconst_addr(la)
             gaps: list[str] = []
             _, consts = self._address_terms(addr)
@@ -8887,6 +9587,8 @@ class TaintEngine:
             else:
                 for w in self._load_writers(ssaf, load, la):
                     kind = w[0]
+                    if kind in ("may_source", "opaque"):
+                        _provider_writes(w[1], la[0])
                     if kind in ("store", "partial", "may"):
                         store = w[1]
                         reason = {"store": "reaching store to field",
@@ -8906,7 +9608,9 @@ class TaintEngine:
                                         "cannot prove disjoint from them")
                     elif kind == "may_source":
                         steps.append(_instr_dict(w[1], reason=f"field may be filled by source {w[2]}"))
-                        _set_origin({"kind": "source", "callee": w[2]})
+                        _set_origin({"kind": "source", "callee": w[2],
+                                     **({"address": hex(int(w[1].address))}
+                                        if self.project_context is not None else {})})
                         gaps.append(f"`{w[1]}` may have written them (no call's write "
                                     "extent is trusted)")
                     elif kind == "opaque":
@@ -8919,6 +9623,9 @@ class TaintEngine:
                             f"on some path nothing in this function wrote them (the "
                             f"{'global' if fixed is not None else 'object'} "
                             f"holds what was stored before this function ran)")
+                        if self.project_context is not None:
+                            for r in addr_reads:
+                                walk(r, d + 1, lmv, (addr, 0))
                     else:
                         gaps.append(f"the memory chain exceeded {MEM_CHAIN_BUDGET} versions")
                 if not gaps:
@@ -8940,13 +9647,26 @@ class TaintEngine:
                            + "; ".join(dict.fromkeys(gaps))
                            + " -- the slice is NOT complete"),
             }
+            self._project_row(leaf, func=func)
             if leaf not in self._bw_leaves:
                 self._bw_leaves.append(leaf)
             _set_origin({"kind": "field_load_unresolved", "base": base_label,
                          "offset": offset, "width": leaf["width"]})
 
         seed_mv = self._mem_in(seed_ins) if seed_ins is not None else None
-        if isinstance(seed_var, _BufferSeed):
+        if writer_seed:
+            _walk_pointer_object(seed_ins, seed_var, 0, seed_mv,
+                                 "provider output parameter", before="the provider ran")
+            if "TAILCALL" in op_name(seed_ins):
+                _provider_writes(seed_ins, _ssa_root_key(seed_var))
+            if origin["kind"] == "unresolved":
+                walk(seed_var, 0, seed_mv, anchor)
+        elif seed_expr is not None:
+            state = _follow_input(seed_ins, seed_expr, 0, seed_mv,
+                                  str(seed_expr), "the expression supplying", anchor)
+            if state == "literal":
+                _set_origin({"kind": "constant", "value": self._int_const(seed_expr)})
+        elif isinstance(seed_var, _BufferSeed):
             # `popen(&cmd, "r")` with the address folded into the parameter:
             # the seed IS the buffer's contents, read by the sink call itself.
             if seed_var.local is not None:
@@ -8958,6 +9678,27 @@ class TaintEngine:
         else:
             walk(seed_var, 0, seed_mv, anchor)
         base_steps = list(reversed(steps))
+        if self.project_context is not None:
+            for leaf in self._bw_leaves[leaf_start:]:
+                self._project_row(leaf, func=func)
+            for source in source_origins:
+                if source != origin:
+                    project_slices.append({"steps": [], "origin": source, "crossed": []})
+            for sub in project_slices:
+                sub["steps"] = sub["steps"] + base_steps
+            if terminal_params:
+                if depth >= max_depth or self._function_key(func) in visited_funcs:
+                    self._bw_project_boundary(
+                        "backward_depth_limit" if depth >= max_depth else "backward_recursion",
+                        func, seed_ins)
+                else:
+                    cont = self._bw_project_callers(
+                        func, terminal_params, depth, max_depth,
+                        visited_funcs | {self._function_key(func)}, base_steps,
+                        param_demands, invocation)
+                    if cont:
+                        return project_slices + cont
+            return project_slices + [{"steps": base_steps, "origin": origin, "crossed": []}]
 
         # continue into callers only when the value's origin here is a parameter
         if (origin["kind"] == "parameter" and depth < max_depth
@@ -9072,6 +9813,7 @@ class TaintEngine:
                 f"leaf's `declare_value_role.entry` is a TEMPLATE")
         if recovered:
             leaf["recovered_from_register"] = True
+        self._project_row(leaf, func=func)
         if leaf not in self._bw_leaves:
             self._bw_leaves.append(leaf)
 
@@ -9152,8 +9894,7 @@ class TaintEngine:
             return False
         idx = int(sink.get("index", -1))
         done = False
-        for site in self._find_callsites(instrs, str(sink.get("callee") or ""),
-                                         resolve_indirect=True):
+        for site in self._bw_sink_sites(instrs, sink):
             params = self._call_params(site)
             if 0 <= idx < len(params):
                 self._bw_pointer_demand(func, ssaf, site, idx, params[idx], recovered=False,
@@ -9399,6 +10140,7 @@ class TaintEngine:
                      "past the cap) -- an origin reachable only from an unfollowed "
                      "caller is missing from this slice"),
         }
+        self._project_row(leaf, func=func)
         if leaf not in self._bw_leaves:
             self._bw_leaves.append(leaf)
 
@@ -9415,7 +10157,7 @@ class TaintEngine:
                 raise TaintError(
                     f"--sink arg index {idx} is invalid: argument indices are "
                     f"0-based and must be >= 0")
-            sites = self._find_callsites(instrs, callee, resolve_indirect=True)
+            sites = self._bw_sink_sites(instrs, sink)
             if not sites:
                 # If the function dispatches through unresolved indirect calls,
                 # name them and point at --resolve-map instead of a bare not-found

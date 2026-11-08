@@ -24,6 +24,7 @@ module one-way (design spec §3.2).
 from __future__ import annotations
 
 import difflib
+from types import SimpleNamespace
 from typing import Any
 
 try:
@@ -35,6 +36,7 @@ from . import il_format
 from . import taint_engine as _taint
 from ._shared import _parse_address, _require_mapped_address, _validate_count
 from .bridge_state import require_analysis
+from .project_analysis import current as _project_current
 
 # THE definition of BN's import symbol-kind mapping -- the (SymbolType, kind)
 # pairs a by-kind import LOOKUP walks, in resolution-preference order (#827
@@ -76,6 +78,123 @@ def _landing_pad_note(bv) -> str | None:
     except Exception:  # noqa: BLE001 - no section list means no claim to make
         return None
     return _LANDING_PAD_NOTE if any(n.startswith(".gcc_except_table") for n in names) else None
+
+
+def _project_function_identity(project, bv, function):
+    return {**il_format._function_identity(function), **project.identity(bv, function)}
+
+
+def _project_qualify_context(project, bv, context):
+    context.update(project.identity(bv))
+    for key in ("function", "symbol"):
+        if isinstance(context.get(key), dict):
+            context[key].update(project.identity(bv))
+    return context
+
+
+def _project_read_completeness(project, result):
+    """Counts describe discovered rows, never an unexamined project tail."""
+    metadata = project.metadata()
+    incomplete = not metadata.get("complete", True)
+    result["complete"] = not incomplete
+    result["partial"] = incomplete
+    result["truncated"] = bool(result.get("truncated") or metadata.get("truncated") or incomplete)
+    if incomplete:
+        result["boundaries"] = metadata.get("boundaries", [])
+        for key in ("total", "code_ref_count", "data_ref_count", "caller_function_count",
+                    "caller_total"):
+            value = result.get(key)
+            if value is not None:
+                result[key + "_lower_bound"] = value
+                result[key] = None
+    return result
+
+
+def _project_xrefs_to_address(ctx, project, bv, address, *, offset, limit,
+                              fn_pointer_scan, require_refs_or_mapped):
+    """Union native source-local references with the shared bound-call index."""
+    function = bv.get_function_at(address)
+    symbol = bv.get_symbol_at(address)
+    symbol_type = getattr(getattr(symbol, "type", None), "name", "")
+    is_import = symbol_type in {
+        "ImportedFunctionSymbol", "ImportedDataSymbol", "ImportAddressSymbol", "ExternalSymbol"
+    }
+    resolved = project.resolve(bv, address) if function is not None or is_import else None
+    target_view, target_address = bv, address
+    target_function = function
+    if target_function is None and is_import:
+        target_function = SimpleNamespace(start=address, name=str(getattr(symbol, "name", "")))
+    if resolved is not None and resolved.status == "resolved":
+        target_view, target_address = resolved.view, resolved.address
+        target_function = resolved.function
+    locations = [(bv, address)]
+    if project.file_id(target_view) != project.file_id(bv) or target_address != address:
+        locations.append((target_view, target_address))
+    code, data = {}, {}
+    extra = {}
+    for source_view, local_address in locations:
+        local = _xrefs_to_address(
+            ctx, source_view, local_address, fn_pointer_scan=fn_pointer_scan,
+            require_refs_or_mapped=require_refs_or_mapped and source_view is bv,
+            _project_local=True)
+        for key in ("fn_pointer_scan_truncated", "stub_callers_via"):
+            if key in local:
+                extra[key] = local[key]
+        for kind, rows in (("code", local["code_refs"]), ("data", local["data_refs"])):
+            for row in rows:
+                ref_address = int(row["address"], 16)
+                row.update(project.identity(source_view, address=ref_address))
+                if isinstance(row.get("caller_function"), dict):
+                    row["caller_function"].update(project.identity(source_view))
+                if isinstance(row.get("context"), dict):
+                    _project_qualify_context(project, source_view, row["context"])
+                # A local import veneer forwarding to the provider isn't an
+                # application caller. The reverse index reports the real site.
+                caller = row.get("caller_function")
+                if kind == "code" and caller:
+                    caller_resolution = project.resolve(source_view, int(caller["address"], 16))
+                    if caller_resolution.cross_file and caller_resolution.status == "resolved":
+                        continue
+                (code if kind == "code" else data).setdefault(
+                    (project.file_id(source_view), ref_address), row)
+    if target_function is not None:
+        for site in project.callers(target_view, target_function):
+            caller = _project_function_identity(project, site.view, site.function)
+            row = {
+                **project.identity(site.view, address=site.address),
+                "function": str(site.function.name),
+                "caller_function": caller,
+                "kind": "code",
+                "context": _project_qualify_context(
+                    project, site.view,
+                    ctx._address_context(site.view, site.address, include_disasm=True,
+                                         arch=getattr(site.function, "arch", None), assume_code=True)),
+            }
+            code.setdefault((project.file_id(site.view), site.address), row)
+    target_context = _project_qualify_context(
+        project, target_view,
+        ctx._address_context(target_view, target_address, include_disasm=True))
+    if target_function is not None:
+        target_context["function"] = {
+            **(target_context.get("function") or {}),
+            **_project_function_identity(project, target_view, target_function),
+        }
+    result = _xref_envelope(
+        target_address, target_context,
+        [code[key] for key in sorted(code)], [data[key] for key in sorted(data)],
+        offset=offset, limit=limit, extra=extra)
+    result["caller_function_count"] = len({
+        (row["project_file_id"], row["caller_function"]["address"])
+        for row in code.values() if row.get("caller_function")
+    })
+    if resolved is not None:
+        result["resolution"] = resolved.status
+        result["resolution_detail"] = resolved.reason
+        if resolved.cross_file:
+            result["resolved_from"] = resolved.source
+    if result.get("fn_pointer_scan_truncated"):
+        project.boundary("function_pointer_scan_limit", bv=bv, address=address)
+    return _project_read_completeness(project, result)
 
 
 def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int | None = None,
@@ -402,6 +521,10 @@ def _xrefs_ambiguous(ctx, bv, identifier: str, bodies, *, offset: int = 0, limit
             "code_ref_count": _code_ref_count(bv, addr),
             "is_thunk": _is_thunk_like(bv, fn),
         })
+    project = _project_current(bv)
+    if project is not None:
+        for member in members:
+            member.update(project.identity(bv))
     members.sort(key=lambda m: (-m["code_ref_count"], int(m["address"], 16)))
     chosen = members[0]
     chosen_addr = int(chosen["address"], 16)
@@ -419,6 +542,8 @@ def _xrefs_ambiguous(ctx, bv, identifier: str, bodies, *, offset: int = 0, limit
             f"(most code refs: {chosen['code_ref_count']}). Other members: {others}"
         ),
     }
+    if project is not None:
+        result["ambiguous_symbol"].update(project.identity(bv))
     return result
 
 
@@ -464,8 +589,21 @@ def _xrefs_any(ctx, selector: str | None, symbols: list[Any]) -> dict[str, Any]:
         target_context = res.get("target_context")
         if isinstance(target_context, dict) and target_context.get("kind") == "string":
             row["target_kind"] = "string"
+        if _project_current(bv) is not None:
+            if isinstance(target_context, dict):
+                for key in ("project_file_id", "project_path"):
+                    if key in target_context:
+                        row[key] = target_context[key]
+            for key in ("target_context", "resolved_from", "resolution", "resolution_detail",
+                        "complete", "partial", "truncated", "boundaries",
+                        "code_ref_count_lower_bound", "data_ref_count_lower_bound",
+                        "caller_function_count_lower_bound"):
+                if key in res:
+                    row[key] = res[key]
         results.append(row)
-    return {"kind": "symbol_presence", "items": results, "count": len(results), "present": present}
+    result = {"kind": "symbol_presence", "items": results, "count": len(results), "present": present}
+    project = _project_current(bv)
+    return _project_read_completeness(project, result) if project is not None else result
 
 
 def _drop_legacy_ref_arrays(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -642,7 +780,13 @@ def _function_pointer_data_refs(ctx, bv, address: int, existing_addrs: set[int])
 
 def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | None = None,
                       fn_pointer_scan: bool = False,
-                      require_refs_or_mapped: bool = False) -> dict[str, Any]:
+                      require_refs_or_mapped: bool = False,
+                      _project_local: bool = False) -> dict[str, Any]:
+    project = None if _project_local else _project_current(bv)
+    if project is not None:
+        return _project_xrefs_to_address(
+            ctx, project, bv, address, offset=offset, limit=limit,
+            fn_pointer_scan=fn_pointer_scan, require_refs_or_mapped=require_refs_or_mapped)
     code_refs = []
     data_refs = []
     # One read of each ref list, two consumers (#815). `all_code_refs` is BN's
@@ -813,6 +957,9 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
         if resolved is not None and resolved.get("kind") in {"data", "placeholder"}:
             result = _xrefs_to_address(ctx, bv, data_address, offset=offset, limit=limit)
             result["resolved_symbol"] = resolved
+            project = _project_current(bv)
+            if project is not None:
+                result["resolved_symbol"] = {**resolved, **project.identity(bv)}
             return result
         available: list[str] = []
         for attr_name, kind in _IMPORT_SYMBOL_TYPES:
@@ -849,6 +996,8 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
     result = _xrefs_to_address(ctx, bv, sym_address, offset=offset, limit=limit)
     result["import_resolved"] = True
     result["import_name"] = str(identifier)
+    if _project_current(bv) is not None:
+        return result
 
     if not result.get("code_refs"):
         manual, scan_truncated, scan_note = _scan_for_calls_to(ctx, bv, sym_address)

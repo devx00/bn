@@ -53,6 +53,8 @@ from ._shared import OperationFailure, _parse_address, _validate_bool, is_import
 from .bridge_state import require_analysis
 from .read_taint_models import build_catalog
 from .read_listing import _analysis_state_fields
+from .project_analysis import current
+from .taint_result import apply_project_boundaries, backward_diagnostics
 from .target_hint import positional_selector
 
 
@@ -86,6 +88,9 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     # Absent from the request -> the engine's own default, so every existing
     # caller and the backward path are unaffected.
     _engine_kwargs: dict[str, Any] = {}
+    project_context = current(bv)
+    if project_context is not None:
+        _engine_kwargs["project_context"] = project_context
     if params.get("max_iters") is not None:
         _engine_kwargs["max_iters"] = int(params["max_iters"])
     # #1041 item 3: the map is validated when the engine is built, so a bad
@@ -1167,6 +1172,7 @@ _FRONTIER_EXAMPLE_KEYS = (
     "ssa_label", "address", "depth", "callee", "callee_display_name", "out_param_callee",
     "base", "offset", "width", "function_context", "function_context_display_name",
     "out_param_callee_display_name", "param_index", "param_register", "local",
+    "project_file_id", "project_path", "target",
 )
 _FRONTIER_EXAMPLE_CAP = 3
 
@@ -1524,6 +1530,92 @@ def _find_return_vars(ctx, ssa_func, bv=None, _visited=None) -> list[SSAVariable
     return ret_vars
 
 
+def _project_backward_slice(ctx, bv, func, project_context, *, target_addr: int,
+                            arg_index: int, arg_label: dict[str, Any], view: str,
+                            max_depth: int, ip_depth: int, mangled: bool,
+                            hints: list[str]) -> dict[str, Any]:
+    """Adapt the shared backward engine to trace's presentation contract."""
+    try:
+        engine = _taint.TaintEngine(
+            bv, _taint.load_models(),
+            find_variable=lambda fn, sel: vars_mod._find_variable_selector(fn, sel)[0],
+            project_context=project_context, mangled=mangled)
+        analysis = engine.backward(
+            func, [{"kind": "arg", "callee": arg_label.get("callee") or hex(target_addr),
+                    "index": arg_index, "address": hex(target_addr)}],
+            max_depth=ip_depth)
+    except _taint.TaintError as exc:
+        raise OperationFailure("unsupported", str(exc)) from exc
+    apply_project_boundaries(analysis, project_context.metadata())
+    trace: list[dict[str, Any]] = []
+    omitted = False
+
+    def append_step(step, *, depth, terminal=False, origin=None):
+        nonlocal omitted
+        if len(trace) >= max_depth:
+            omitted = True
+            return
+        row = dict(step)
+        row.setdefault("depth", depth)
+        row.setdefault("ssa_var", row.get("var") or row.get("seed") or "")
+        row.setdefault("ssa_label", row["ssa_var"])
+        row.setdefault("operation", row.get("op"))
+        row.setdefault("il_text", row.get("text", ""))
+        row["terminates"] = terminal
+        row.setdefault("reason", (origin or {}).get("kind") if terminal else "definition")
+        if row.get("function"):
+            row.setdefault("function_context", row["function"])
+        if origin is not None:
+            row["origin"] = origin
+            if origin.get("kind") == "parameter":
+                row["reason"] = "function_parameter"
+                row["param_index"] = origin.get("index")
+        trace.append(row)
+
+    for sl in analysis.get("slices") or []:
+        steps = sl.get("slice") or []
+        origin = sl.get("origin") or {}
+        for depth, step in enumerate(steps):
+            append_step(step, depth=depth)
+        # Keep the origin as its own endpoint: the last instruction can be in
+        # a different file than the caller/producer where the walk terminates.
+        append_step(origin, depth=len(steps), terminal=True, origin=origin)
+    for leaf in analysis.get("leaves") or []:
+        append_step({**leaf, "reason": leaf.get("kind")}, depth=0, terminal=True)
+    stats = analysis.setdefault("stats", {})
+    assumptions = list(analysis.get("assumptions") or [])
+    diagnostics = dict(analysis.get("diagnostics") or {})
+    if omitted:
+        stats["truncated"] = True
+        stats["truncation_cause"] = sorted(set(stats.get("truncation_cause") or []) | {"trace_steps"})
+        assumptions.append(f"Trace display reached max_depth={max_depth}; additional steps are omitted.")
+        diagnostics.update(backward_diagnostics(
+            analysis.get("leaves") or [], assumptions,
+            sinks_seeded=int(diagnostics.get("sinks_seeded", 0)),
+            slices=len(analysis.get("slices") or []),
+            unresolved_origins=sum((s.get("origin") or {}).get("kind") == "unresolved"
+                                   for s in analysis.get("slices") or []),
+            truncated=True, truncation_cause=stats["truncation_cause"]))
+    if view != "mlil":
+        hints.append(f"Project interprocedural tracing uses MLIL SSA (requested {view}).")
+    endpoint = project_context.identity(bv, func)
+    result = {
+        "function": func.name, "function_display_name": il_format._display_name(func),
+        "function_address": hex(func.start), "target_address": hex(target_addr),
+        "project_file_id": endpoint["project_file_id"],
+        "project_path": endpoint["project_path"],
+        "arg_index": arg_index, "arg_label": arg_label,
+        "callee": arg_label.get("callee") or None,
+        "view": "mlil", "requested_view": view, "interprocedural": True,
+        "ip_depth": ip_depth, "truncated": bool(stats.get("truncated")),
+        "step_count": len(trace), "trace": trace, "frontiers": _summarize_frontiers(trace),
+        "assumptions": assumptions, "hints": hints, "stats": stats,
+        "diagnostics": diagnostics, "leaves": analysis.get("leaves") or [],
+        "slices": analysis.get("slices") or [],
+    }
+    return project_context.annotate(result)
+
+
 def _backward_slice(
     ctx,
     selector: str | None,
@@ -1658,6 +1750,13 @@ def _backward_slice(
                 f"arg {arg_index} is the constant {hex(cval)} -- a compile-time "
                 f"immediate with no SSA definition to trace back."
             )
+
+    project_context = current(bv) if interprocedural else None
+    if project_context is not None:
+        return _project_backward_slice(
+            ctx, bv, func, project_context, target_addr=target_addr,
+            arg_index=arg_index, arg_label=arg_label, view=view,
+            max_depth=max_depth, ip_depth=ip_depth, mangled=mangled, hints=hints)
 
     trace = _build_backward_trace(
         ctx, bv, ssa_func, initial_vars, max_depth,

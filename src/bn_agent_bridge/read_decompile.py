@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from types import SimpleNamespace
 from typing import Any
 
 try:
@@ -63,6 +64,7 @@ from ._shared import (  # noqa: F401
 )
 from .bridge_state import require_analysis
 from .read_listing import _analysis_state_fields
+from .project_analysis import current as _project_current
 
 
 def _warning_row(code: str, summary: str, detail: str, **extra: Any) -> dict[str, Any]:
@@ -3163,9 +3165,137 @@ def _callgraph_names(fn, sym) -> dict[str, Any]:
     return {"name": None, "display_name": None}
 
 
+def _project_callgraph_target(project, resolved):
+    endpoint = dict(resolved.target or resolved.source)
+    if resolved.function is not None:
+        endpoint.update(_callgraph_names(resolved.function, None))
+    endpoint["resolution"] = resolved.status
+    if resolved.reason:
+        endpoint["resolution_detail"] = resolved.reason
+    return endpoint
+
+
+def _project_call_instructions(project, bv, func):
+    try:
+        instructions = iter(il_format._il_function_for(func, "mlil", True).instructions)
+    except Exception as exc:
+        project.boundary("missing_il", bv=bv, address=int(func.start), detail=str(exc))
+        return
+    for index in range(read_xrefs.SCAN_CALLS_MAX_INSNS + 1):
+        try:
+            instruction = next(instructions)
+        except StopIteration:
+            return
+        except Exception as exc:
+            project.boundary("missing_il", bv=bv, address=int(func.start), detail=str(exc))
+            return
+        if index == read_xrefs.SCAN_CALLS_MAX_INSNS:
+            project.boundary("instruction_limit", bv=bv, address=int(func.start))
+            return
+        if "CALL" in il_format._il_op_name(instruction):
+            yield instruction
+
+
+def _project_resolved_calls(ctx, project, bv, func, *, direction, resolve_indirect):
+    selected = project.resolve(bv, int(func.start))
+    result = {"kind": "callgraph", "resolution": selected.status,
+              "resolution_detail": selected.reason}
+    if selected.status == "resolved":
+        if selected.cross_file:
+            result["resolved_from"] = selected.source
+        bv, func = selected.view, selected.function
+    result["function"] = read_xrefs._project_function_identity(project, bv, func)
+    if direction in ("callees", "both"):
+        callees = []
+        seen = set()
+        for ins in _project_call_instructions(project, bv, func):
+            address = int(getattr(ins, "address", func.start))
+            local = _taint.resolve_call_target(bv, ins, follow_thunks=False)
+            is_load = "LOAD" in il_format._il_op_name(getattr(ins, "dest", None))
+            candidates = project.indirect_targets(bv, ins)
+            row = {
+                **project.identity(bv),
+                "call_addr": hex(address),
+                "il_index": int(getattr(ins, "instr_index", -1)),
+                "source": project.identity(bv, func, address=address),
+            }
+            if candidates and not resolve_indirect:
+                row.update(kind="indirect", dest_expr=str(getattr(ins, "dest", "")),
+                           resolution="disabled", resolution_detail="indirect_resolution_disabled")
+                project.boundary("indirect_resolution_disabled", bv=bv, address=address)
+            elif candidates:
+                targets = {}
+                for candidate in candidates:
+                    target = project.resolve(bv, int(candidate))
+                    endpoint = _project_callgraph_target(project, target)
+                    targets[(endpoint.get("project_file_id"), endpoint.get("address"))] = endpoint
+                row.update(kind="indirect", dest_expr=str(getattr(ins, "dest", "")),
+                           resolved=list(targets.values()), resolution="possible_values")
+            else:
+                resolved = project.resolve_call(bv, ins)
+                if (local.address is not None and not is_load) or resolved.status == "resolved":
+                    endpoint = _project_callgraph_target(project, resolved)
+                    if resolved.status != "resolved" and local.address is not None:
+                        endpoint.update(_callgraph_names(
+                            getattr(local, "function", None), bv.get_symbol_at(local.address)))
+                    row.update(kind="direct", target=endpoint,
+                               resolution=resolved.status, resolution_detail=resolved.reason)
+                else:
+                    row.update(kind="indirect", dest_expr=str(getattr(ins, "dest", "")),
+                               resolution=resolved.status, resolution_detail=resolved.reason)
+                    if resolve_indirect:
+                        row["resolved"] = []
+                    project.boundary("unresolved_indirect_call", bv=bv, address=address)
+            endpoints = [row["target"]] if "target" in row else row.get("resolved", [])
+            edge = (
+                *project.function_key(bv, func), address, row["kind"],
+                tuple((endpoint.get("project_file_id"), endpoint.get("address")) for endpoint in endpoints),
+            )
+            if edge not in seen:
+                seen.add(edge)
+                callees.append(row)
+        result["callees"] = callees
+    if direction in ("callers", "both"):
+        callers = {}
+        for site in project.callers(bv, func):
+            key = (*project.function_key(site.view, site.function), site.address)
+            callers.setdefault(key, {
+                **project.identity(site.view),
+                "call_addr": hex(site.address),
+                "caller": read_xrefs._project_function_identity(project, site.view, site.function),
+            })
+        result["callers"] = [callers[key] for key in sorted(callers)]
+    return read_xrefs._project_read_completeness(project, result)
+
+
 def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resolve_indirect: bool = True):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier, contained=True)
+    project = _project_current(bv)
+    try:
+        func = ctx._find_function(bv, identifier, contained=True)
+    except RuntimeError as exc:
+        if project is None or "Ambiguous" in str(exc):
+            raise
+        try:
+            address = _parse_address(identifier)
+        except (TypeError, ValueError, RuntimeError):
+            symbol = read_xrefs._find_import_symbol(ctx, bv, str(identifier))
+        else:
+            symbol = bv.get_symbol_at(address)
+        if symbol is None:
+            raise
+        symbol_type = str(getattr(getattr(symbol, "type", None), "name", ""))
+        if symbol_type not in {"ImportedFunctionSymbol", "ImportedDataSymbol",
+                               "ImportAddressSymbol", "ExternalSymbol"}:
+            raise
+        func = SimpleNamespace(start=int(symbol.address), name=str(symbol.name))
+    if project is not None:
+        result = _project_resolved_calls(
+            ctx, project, bv, func, direction=direction, resolve_indirect=resolve_indirect)
+        _annotate_containment(ctx, result, identifier, func)
+        if isinstance(result.get("resolved_from"), dict):
+            result["resolved_from"].update(project.identity(bv))
+        return result
     # `kind` lets a consumer of the {kind, ...} family identify a callgraph read
     # (it is a composite callees+callers structure, not a flat items list) (#371.2).
     result: dict[str, Any] = {

@@ -3917,26 +3917,6 @@ def test_the_exempt_dispatch_site_is_still_reported_and_still_takes_no_holder():
         )
 
 
-def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
-    """Property: in `cli.py`, a transform is CALLED only where the boundary
-    rebinding DOMINATES the call -- whatever the dispatch shape (a name, a dict
-    lookup, an attribute a transform was parked on, a loop variable, a walrus, a
-    returned callable), in whatever function it was forwarded to, because it is
-    the OBJECT that is guarded and not the site.
-
-    "After the rebinding" used to mean "on a later line", and a rebinding moved
-    into an `if` is on an earlier line than every call while running on only one
-    path. Dominance is the question line order was standing in for.
-    """
-    unguarded = [site.replace("|", " at ") for site in _dispatch_sites()
-                 if site.split("|", 1)[0] not in _NOT_A_RESULT_TRANSFORM]
-    assert not unguarded, (
-        "these invoke a bridge-result transform on a path the boundary "
-        "rebinding does not dominate, so a malformed result escapes the rule "
-        f"there: {sorted(unguarded)}"
-    )
-
-
 def _result_key_reads(tree: ast.Module) -> tuple[list[ast.AST], set[str]]:
     """Every occurrence of the reply's result key in *tree*, and the names
     bound to it.

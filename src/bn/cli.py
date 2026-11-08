@@ -2895,6 +2895,47 @@ _depth_int = _int_at_least(0, "depth")
 _positive_depth_int = _int_at_least(1, "depth")
 
 
+def project_analysis_args() -> list[tuple[tuple[str, ...], dict[str, Any]]]:
+    """Shared project traversal controls; omitted values stay bridge defaults."""
+    def bounded(maximum: int, label: str) -> Callable[[str], int]:
+        positive = _int_at_least(1, label)
+
+        def parse(value: str) -> int:
+            parsed = positive(value)
+            if parsed > maximum:
+                raise argparse.ArgumentTypeError(
+                    f"{label} must be an integer <= {maximum}, got {parsed}")
+            return parsed
+
+        return parse
+
+    options = [
+        arg("--no-project", dest="project", action="store_false", default=None,
+            help="Analyze only the selected binary, without project library traversal"),
+    ]
+    for name, default, maximum, description in (
+        ("files", 16, 256, "Project analysis file budget"),
+        ("depth", 8, 64, "Project dependency-loading depth budget (not analysis --max-depth)"),
+        ("functions", 4096, 100000, "Project reverse caller-index function budget"),
+    ):
+        options.append(arg(
+            f"--project-max-{name}", default=None, metavar="N",
+            type=bounded(maximum, f"project {name}"),
+            help=f"{description} (bridge default: {default}; "
+                 f"1..{maximum}); applies only to project-backed targets"))
+    return options
+
+
+def _project_analysis_params(args: argparse.Namespace) -> dict[str, Any]:
+    """Forward explicit project knobs only, preserving old standalone requests."""
+    return {
+        key: value
+        for key in ("project", "project_max_files", "project_max_depth",
+                    "project_max_functions")
+        if (value := getattr(args, key, None)) is not None
+    }
+
+
 def _pick(positional: Any, flag: Any, label: str, *, required: bool = True) -> Any:
     """Resolve a value supplied either positionally or via a flag alias.
 

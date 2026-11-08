@@ -373,6 +373,12 @@ bn project close
 
 `bn project open` pins this checkout (the pin is per git root, like `bn instance use`) to the bridge instance that owns the project, attaching to an existing owner when one is running; another checkout joins with `bn project attach`. Inside a project, select a file with `bn project load <selector>`, which accepts the file's path-in-project, id (or an 8+ character id prefix), or unique name; once loaded it is an ordinary target, selected with `-t <path-in-project>` (leading `/` optional), its id, or its file name. `bn save -t <selector>` writes the first database as `<name>.bndb` beside the raw file inside the project; later saves snapshot it; `bn save` takes no output path for a project target. Use `bn project export` to copy files out, `bn project import` to add new files, and `bn project delete` to remove them. `bn project close` closes the project's targets and the project when none has unsaved changes (`--force` discards them).
 
+### Cross-library project analysis
+
+Project-backed taint, callgraphs, callsites, and xrefs follow explicit library bindings to provider implementations, with file-qualified locations and bounded automatic provider loading. Forward/backward taint crosses argument, return-value, buffer, and output-parameter boundaries; reverse queries discover callers in other project files. `trace --interprocedural` shares this context, while ordinary trace remains local.
+
+Use `--no-project` for single-binary analysis of a project target. Standalone targets retain their existing behavior and do not load project providers. Project controls are `--project-max-files`, `--project-max-depth` (dependency loading), and `--project-max-functions` (reverse index scanning); these do not replace taint's analysis-depth limit. Provider views stay open on the owner bridge, without implicit saves or pin changes, so use explicit `-i`/`-t`. Check `project_analysis` boundaries and partial-count disclosures before treating a result as complete. See the [project workflow](skills/bn-projects/SKILL.md#cross-library-analysis) for commands, budgets, and finding provenance.
+
 ### Shared project findings
 
 `bn project finding` keeps typed, evidence-backed claims and their review history inside the project. Install the optional guidance with `bn skill install projects`; the [project skill](skills/bn-projects/SKILL.md#shared-findings-retrieve-record-independently-review) documents the JSON schemas and agent workflow.

@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from .. import cli
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, demangle_compat_arg, mangled_arg, mutex, mutation_output_args, preview_arg, read_text_input
+from ..cli import _project_analysis_params, project_analysis_args
 from ..formatters import (
     disclosure_boundary,
     _render_call_descriptors_text,
@@ -786,6 +787,7 @@ def _function_cfg(args: argparse.Namespace) -> int:
              arg("--fn-pointer-scan", action="store_true",
                  help="Also scan stored function pointers for references"),
              mangled_arg(),
+             *project_analysis_args(),
          ],
          estimable=True)
 def _xrefs(args: argparse.Namespace) -> int:
@@ -793,6 +795,9 @@ def _xrefs(args: argparse.Namespace) -> int:
     identifier = getattr(args, "identifier", None)
     any_symbols = getattr(args, "any_symbols", None)
     fn_pointer_scan = getattr(args, "fn_pointer_scan", False)
+    project_params = _project_analysis_params(args)
+    if field_spec and project_params:
+        raise BridgeError("project analysis options do not apply to xrefs --field")
     if any_symbols:
         # #410: accept comma-separated lists as well as space-separated, so
         # `--any read,recv,memcpy` (or `read, recv, memcpy`) probes three symbols
@@ -812,7 +817,7 @@ def _xrefs(args: argparse.Namespace) -> int:
         return _call(
             args,
             "xrefs_any",
-            {"symbols": any_symbols},
+            {"symbols": any_symbols, **project_params},
             require_target=True,
             text_renderer=_render_xrefs_any_text,
             stem="xrefs-any",
@@ -851,6 +856,7 @@ def _xrefs(args: argparse.Namespace) -> int:
     # offset/limit to the op or the renderer would group only a slice.
     _reject_text_mode_offset(args, "xrefs")   # #738
     params: dict[str, Any] = {"identifier": identifier}
+    params.update(project_params)
     if fn_pointer_scan:
         params["fn_pointer_scan"] = True
     limit = _effective_limit(args)
@@ -943,6 +949,7 @@ def _load_within_identifiers(path: Path) -> list[str]:
              arg("--caller-static", action="store_true",
                  help="Prefer caller_static-first text output for return-address mapping workflows"),
              mangled_arg(),
+             *project_analysis_args(),
          ],
          mutex_groups=[
              mutex(False,
@@ -969,6 +976,7 @@ def _callsites(args: argparse.Namespace) -> int:
         "within_identifiers": within_identifiers,
         "context": args.context,
         "caller_static": bool(args.caller_static),
+        **_project_analysis_params(args),
     }
     # #824: unconditional, like the sibling paged reads.
     params["offset"] = args.offset
@@ -1331,15 +1339,17 @@ def _evidence_init(args: argparse.Namespace) -> int:
                  help="Maximum trace steps before truncation (>= 1; default: 50)"),
              arg("--interprocedural", action="store_true", default=False,
                  help="Follow return values across call boundaries into callees. "
-                      "Out-pointer/output-parameter writes are NOT followed; a value "
-                      "loaded from a local an earlier call filled by-address is "
-                      "reported as `interprocedural_out_param_not_followed` (naming "
-                      "the callee), not traced into the callee (#416). The same "
-                      "out-pointer fill is reported as `out_param_not_followed` in "
-                      "intra mode (this flag off), for a call in the same function."),
+                      "Project-backed analysis also follows provider output-parameter "
+                      "writes. Standalone or --no-project analysis does NOT follow "
+                      "out-pointer/output-parameter writes: a value loaded from a local "
+                      "an earlier call filled by-address is reported as "
+                      "`interprocedural_out_param_not_followed` (naming the callee). "
+                      "With this flag off, that fill is reported as "
+                      "`out_param_not_followed` for a call in the same function."),
              arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
              mangled_arg(),
+             *project_analysis_args(),
          ],
          estimable=True)
 def _trace(args: argparse.Namespace) -> int:
@@ -1355,6 +1365,7 @@ def _trace(args: argparse.Namespace) -> int:
             "interprocedural": args.interprocedural,
             "ip_depth": args.ip_depth,
             "mangled": args.mangled,
+            **_project_analysis_params(args),
         },
         require_target=True,
         contextual_hints=True,

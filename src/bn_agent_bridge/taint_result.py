@@ -63,6 +63,7 @@ BLOCKING_LEAF_KINDS = frozenset({
     "pointer_escape",
     "indirect_call_unresolved",
     "unmodeled_callee",
+    "project_boundary",
     "arg_under_recovered",
     "field_load_unresolved",
     "source_seed_misanchored",
@@ -177,6 +178,12 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
     interprocedural depth cutoff is fixed with ``--max-depth`` -- so a consumer
     that saw only "depth/recursion" was told the wrong remediation."""
     causes = list(truncation_cause or [])
+    if "project" in causes:
+        return ("project traversal was bounded -- inspect project_analysis.boundaries "
+                "and adjust --project-max-files, --project-max-depth or "
+                "--project-max-functions for the reported limit")
+    if "trace_steps" in causes:
+        return "trace display hit the step bound -- raise --max-depth"
     if "fixpoint_exhausted" in causes:
         return ("intra-function fixpoint exhausted its iteration budget before "
                 "converging -- raise --max-iters or narrow the source")
@@ -579,7 +586,8 @@ def backward_diagnostics(
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
                   "object_extent_unknown", "region_store_proof_not_certified",
-                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded")
+                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded",
+                  "project_boundary")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
@@ -763,6 +771,70 @@ def backward_diagnostics(
         "safe_to_report_complete_slice": complete,
         "complete_slice_reason": reason,
     }
+
+
+def apply_project_boundaries(result: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    """Fold project coverage gaps into the existing taint claim gates.
+
+    Keep findings and engine counters intact. A resolver boundary is an
+    incomplete analysis, not necessarily a budget cut; only the resolver's
+    explicit truncation flag adds a truncation cause. Safe to apply again when
+    a reader wraps an engine result.
+    """
+    if metadata.get("complete", True) and not metadata.get("boundaries") and not metadata.get("truncated"):
+        return result
+    leaves = result.setdefault("leaves", [])
+    boundaries = metadata.get("boundaries") or [{"reason": "project_analysis_incomplete"}]
+    for boundary in boundaries:
+        leaf = {**boundary, "kind": "project_boundary"}
+        if leaf not in leaves:
+            leaves.append(leaf)
+    stats = result.setdefault("stats", {})
+    stats["leaves"] = len(leaves)
+    stats["analysis_incomplete"] = True
+    stats["truncated"] = bool(stats.get("truncated") or metadata.get("truncated"))
+    causes = set(stats.get("truncation_cause") or [])
+    if metadata.get("truncated"):
+        causes.add("project")
+    stats["truncation_cause"] = sorted(causes)
+    assumptions = result.setdefault("assumptions", [])
+    caveat = ("Project analysis has unresolved or unexamined library boundaries; "
+              "inspect project_analysis.boundaries. This is not complete coverage.")
+    if caveat not in assumptions:
+        assumptions.append(caveat)
+    old = result.get("diagnostics") or {}
+    if result.get("direction") == "backward":
+        slices = result.get("slices") or []
+        diagnostics = backward_diagnostics(
+            leaves, assumptions,
+            sinks_seeded=int(old.get("sinks_seeded", sum(
+                bool(s.get("seeded")) for s in result.get("sink_status") or []))),
+            slices=len(slices),
+            unresolved_origins=sum(
+                (s.get("origin") or {}).get("kind") == "unresolved" for s in slices),
+            truncated=stats["truncated"], truncation_cause=stats["truncation_cause"])
+        result["diagnostics"] = {**old, **diagnostics, "analysis_incomplete": True}
+    elif not result.get("reached_sinks"):
+        diagnostics = dict(old)
+        safe, reason = _derive_all_clear(
+            leaves, assumptions, truncated=stats["truncated"],
+            truncation_cause=stats["truncation_cause"],
+            unmodeled_reached=bool(old.get("unmodeled_calls_reached")),
+            analysis_incomplete=True)
+        frontier = dict(old.get("frontier") or {})
+        by_kind = dict(frontier.get("by_kind") or {})
+        by_kind["project_boundary"] = sum(lf.get("kind") == "project_boundary" for lf in leaves)
+        frontier["by_kind"] = by_kind
+        diagnostics.update(
+            frontier=frontier, analysis_incomplete=True,
+            truncated=stats["truncated"], truncation_cause=stats["truncation_cause"],
+            safe_to_report_all_clear=safe, all_clear_reason=reason, all_clear_caveats=[])
+        result["diagnostics"] = diagnostics
+    if result.get("diagnostics") is not None:
+        result["diagnostics"]["next_action"] = (
+            "Inspect project_analysis.boundaries; resolve missing or ambiguous library "
+            "bindings and adjust the reported project limit before claiming coverage.")
+    return result
 
 
 def misanchored_recv_leaf(

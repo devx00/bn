@@ -77,7 +77,28 @@ bn -i <owner-instance-id> -t <selector> save
 
 An unreadable mutation counter produces an unmeasured summary (`op_count: null`, exit 4), not a fabricated zero; a reported mutation failure takes precedence at exit 3.
 
-Project links do not yet make taint, callgraph, or xrefs traverse library implementations. Those analyses remain scoped to the selected binary; taint uses external-call models or its conservative unknown-call behavior at imported calls. Loading and analyzing the linked library does not remove that boundary.
+## Cross-library analysis
+
+For a target owned by the open project, `taint forward/backward`, `dataflow callgraph`, `callsites`, and `xrefs` resolve linked imports to the actual provider functions. `trace --interprocedural` uses the same project context; default `trace` stays intraprocedural. Ordinary standalone targets keep their existing single-binary behavior, even when a project is open on the same bridge. `--no-project` explicitly selects single-binary analysis for a project target.
+
+```bash
+bn -i <owner-instance-id> taint forward -t usr/bin/app -f process_request --source param:0 --verbose
+bn -i <owner-instance-id> taint backward -t usr/bin/app -f process_request --sink arg:system:0 --verbose
+bn -i <owner-instance-id> dataflow callgraph process_request -t usr/bin/app --direction both
+bn -i <owner-instance-id> callsites parse_request -t <provider-file-id>
+bn -i <owner-instance-id> xrefs parse_request -t <provider-file-id>
+bn -i <owner-instance-id> taint forward -t usr/bin/app -f process_request --source param:0 --no-project
+```
+
+Forward taint follows argument, return-value, returned-buffer, and output-parameter flows into and out of provider bodies, including nested libraries and sinks inside them. Backward taint follows provider return/output writers and project callers back toward sources, including caller-side writes after a provider returns a buffer. Existing model overlays remain additive to analyzed internal bodies; both import-alias and resolved-provider models apply. A model is not proof that a library implementation was visited. An unqualified indirect resolve-map address still belongs to the selected root binary, not every provider with the same address.
+
+Graph endpoints, callsites, xrefs, and taint source/sink/path locations carry `project_file_id` and `project_path`. Always route a returned address with its file ID: equal addresses in different libraries are different locations. `dataflow callgraph` remains a one-hop graph for the requested function; its provider endpoints can be queried next. Reverse callsites/xrefs include calls from other prepared project files; `callsites --within` still restricts callers to functions in the selected view. Data references retain the address space of their source file.
+
+Before a project read, the owner prepares bounded provider views using normal project loading. They remain open as ordinary targets for reuse; no database is saved implicitly and sticky pins are not changed. Always pass the intended `-t` after preparation can add targets. Existing analyzed views are reused; first-use loading may be slower, so set `BN_REQUEST_TIMEOUT` deliberately for expensive projects. Provider opens/publication take the write gate, analysis runs outside the dispatch read lock, and the original target/project identity is revalidated before traversal.
+
+The shared controls are `--project-max-files` (default 16, maximum 256), `--project-max-depth` (dependency-loading depth, default 8, maximum 64), and `--project-max-functions` (reverse caller-index scan budget, default 4096, maximum 100000). These are separate from taint's `--max-depth` and trace's interprocedural limits. Reverse queries may prepare other native binaries in the project to discover consumers, not just the selected file's dependencies.
+
+Inspect `project_analysis` in JSON and project boundary/partial disclosures in text. Missing files/bindings/bodies, ambiguous exports, unresolved indirect calls, and exhausted budgets are not an all-clear. Incomplete reverse scans cannot promise complete totals. Resolution follows explicit project library bindings, not a global same-name guess or full runtime-loader emulation; explicit bindings take precedence over inferred value-set targets. Speculative lookup failures do not count as unresolved boundaries when a fallback resolves the call. Newly loaded providers use the ordinary automatic link workflow; already-open views are not silently relinked. Fix or explicitly relink stale assignments before relying on a path.
 
 ## Shared findings: retrieve, record, independently review
 
@@ -126,7 +147,7 @@ Evidence is declarative, never executable:
 | `links` | `file` | Already-loaded clean BNDB: external bindings, provider file IDs/content, database and tool fingerprints |
 | `note` | `text` | Preserved explanation/manual reproduction; uncheckable, never run |
 
-Machine checks may carry `description`. Import supporting logs/traces with `project import`, then reference their project-file IDs using `file` evidence. Include the actual analyzed binaries/databases in `scope`, not just the trace attachment. Record relevant assumptions and exact dependency revisions; undisclosed runtime/model/configuration assumptions cannot be checked automatically. A taint finding should scope every relevant binary/database, capture relevant `function`/`links` evidence, and retain source/sink/model limitations. Project bindings still do **not** enable automatic cross-library taint traversal.
+Machine checks may carry `description`. Import supporting logs/traces with `project import`, then reference their project-file IDs using `file` evidence. Include the actual analyzed binaries/databases in `scope`, not just the trace attachment. Record relevant assumptions and exact dependency revisions; undisclosed runtime/model/configuration assumptions cannot be checked automatically. A cross-library taint finding should scope every participating binary/database using the report's file-qualified provenance, capture relevant `function`/`links` evidence, and retain model assumptions and unresolved/budget boundaries. Save the relevant analysis databases explicitly before capturing semantic finding evidence.
 
 Save analysis before capturing semantic checks, select the saved `.bndb` ID, and keep it loaded while checking. Checks never load a view, reanalyze, save, or execute a supplied command. Missing/dirty/incomplete analysis is `unknown`, not current. Unsaved/unavailable capture baselines are not silently repaired later: save/load the intended state and append a corrected claim revision. A changed saved database conservatively invalidates semantic evidence, even for an unrelated edit. Do not replace a live database behind the owner bridge; if that happened, reload before capturing new evidence.
 
